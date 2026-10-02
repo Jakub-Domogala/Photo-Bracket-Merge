@@ -1,5 +1,6 @@
+# Tylko dla referencyjnej wersji Python (reference/) i testów porównawczych (tests/).
+# Aplikacja webowa nie ma zależności — działa w przeglądarce.
 rawpy==0.27.1
 opencv-python==5.0.0.93
 numpy==2.2.6
 ExifRead==3.5.1
-Flask==3.1.3
