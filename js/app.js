@@ -1,4 +1,5 @@
 import { makeZip } from "./zip.js";
+import { RAW_EXTENSIONS, isRaw } from "./formats.js";
 
 const drop = document.getElementById("drop");
 const picker = document.getElementById("picker");
@@ -6,6 +7,7 @@ const mergeBtn = document.getElementById("merge");
 const download = document.getElementById("download");
 const status = document.getElementById("status");
 const DROP_HINT = drop.textContent;
+picker.accept = RAW_EXTENSIONS.flatMap((e) => [e, e.toUpperCase()]).join(",");
 let files = [];
 
 function setStatus(text, error = false) {
@@ -14,8 +16,8 @@ function setStatus(text, error = false) {
 }
 
 function setFiles(list) {
-  files = [...list].filter((f) => f.name.toLowerCase().endsWith(".arw")).sort((a, b) => a.name.localeCompare(b.name));
-  drop.textContent = files.length ? `${files.length} plików ARW: ${files.map((f) => f.name).join(", ")}` : DROP_HINT;
+  files = [...list].filter((f) => isRaw(f.name)).sort((a, b) => a.name.localeCompare(b.name));
+  drop.textContent = files.length ? `${files.length} plików RAW: ${files.map((f) => f.name).join(", ")}` : DROP_HINT;
   mergeBtn.disabled = !files.length;
   download.hidden = true;
   setStatus("");
@@ -30,7 +32,7 @@ drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); setFil
 mergeBtn.onclick = async () => {
   const n = Number(document.getElementById("group").value);
   if (!(n >= 1) || files.length % n) {
-    setStatus(`Błąd: liczba plików ARW (${files.length}) nie dzieli się przez ${n}.`, true);
+    setStatus(`Błąd: liczba plików RAW (${files.length}) nie dzieli się przez ${n}.`, true);
     return;
   }
   if (!self.crossOriginIsolated) {

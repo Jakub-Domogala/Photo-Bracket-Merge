@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Łączy brackety ARW (Sony) w jedno zdjęcie metodą exposure fusion (Mertens).
+Łączy brackety RAW (ARW, CR2/CR3, NEF, RAF, DNG, ORF, RW2, …) w jedno zdjęcie metodą exposure fusion (Mertens).
 Zakłada statyw i brak ruchu w kadrze, więc nie wykonuje wyrównywania.
 
 Pipeline (bez ręcznego strojenia per zdjęcie):
@@ -19,7 +19,7 @@ np. DSC00001-3 -> wynik 1, DSC00004-6 -> wynik 2 itd. Podfoldery są
 przetwarzane tak samo (np. data/input/photo1, data/input/photo2).
 
 Instalacja:  pip install -r requirements.txt
-Użycie:      python bracket_merge.py folder_z_arw -o wyniki
+Użycie:      python bracket_merge.py folder_z_raw -o wyniki
 """
 
 import argparse
@@ -30,6 +30,11 @@ import exifread
 import numpy as np
 import rawpy
 
+RAW_EXTENSIONS = {  # to samo co js/formats.js
+    ".arw", ".srf", ".sr2", ".cr2", ".cr3", ".crw", ".nef", ".nrw", ".raf", ".dng", ".orf",
+    ".rw2", ".rwl", ".pef", ".ptx", ".srw", ".x3f", ".3fr", ".fff", ".iiq", ".mos", ".mef",
+    ".mrw", ".erf", ".kdc", ".dcr", ".raw", ".rwz", ".gpr",
+}
 KEY = 0.12            # docelowa jasność (log-average, liniowo) środkowej klatki
 BLACK_PCT = 0.5       # percentyl luminancji ustawiany jako czerń
 S_CURVE = 0.3         # siła krzywej S (0 = brak)
@@ -59,7 +64,7 @@ def log_average(y: np.ndarray) -> float:
 
 
 def load_raw(path: Path) -> np.ndarray:
-    """Wywołuje ARW do liniowego 16-bit sRGB i zwraca float32 BGR w zakresie 0-1."""
+    """Wywołuje plik RAW do liniowego 16-bit sRGB i zwraca float32 BGR w zakresie 0-1."""
     with rawpy.imread(str(path)) as raw:
         rgb = raw.postprocess(
             use_camera_wb=True,
@@ -74,9 +79,15 @@ def load_raw(path: Path) -> np.ndarray:
 
 def read_lens_profile(path: Path):
     """Profil korekcji obiektywu, który Sony zapisuje w każdym ARW (ten sam, którego aparat
-    używa do JPEG-ów). Zwraca None, jeśli plik go nie ma (np. obiektyw manualny)."""
-    with open(path, "rb") as f:
-        tags = exifread.process_file(f, details=True)
+    używa do JPEG-ów). Zwraca None, jeśli plik go nie ma (np. obiektyw manualny) albo nie
+    jest RAW-em Sony."""
+    try:
+        with open(path, "rb") as f:
+            tags = exifread.process_file(f, details=True)
+    except Exception:
+        return None
+    if not str(tags.get("Image Make", "")).upper().startswith("SONY"):
+        return None
 
     def curve(tag, parts=1):
         t = tags.get(f"EXIF SubIFD0 Tag {tag}")
@@ -213,8 +224,8 @@ def merge(paths, contrast, saturation, exposure, key=KEY, auto_wb=False,
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Łączenie bracketów ARW (exposure fusion).")
-    ap.add_argument("input", type=Path, help="folder z plikami .ARW (lub z podfolderami)")
+    ap = argparse.ArgumentParser(description="Łączenie bracketów RAW (exposure fusion).")
+    ap.add_argument("input", type=Path, help="folder z plikami RAW (lub z podfolderami)")
     ap.add_argument("-o", "--output", type=Path, default=Path("wyniki"), help="folder wyjściowy")
     ap.add_argument("-n", "--group-size", type=int, default=3, help="ile zdjęć w jednym bracketcie")
     ap.add_argument("--brightness", type=float, default=KEY, help=f"docelowa jasność (domyślnie {KEY})")
@@ -232,7 +243,7 @@ def main():
     groups = []
     n = args.group_size
     for d in dirs:
-        files = sorted(p for p in d.iterdir() if p.suffix.lower() == ".arw")
+        files = sorted(p for p in d.iterdir() if p.suffix.lower() in RAW_EXTENSIONS)
         if not files:
             continue
         if len(files) % n:
@@ -240,7 +251,7 @@ def main():
                   f"ostatnie {len(files) % n} zostanie pominięte.")
         groups += [files[i:i + n] for i in range(0, len(files) - n + 1, n)]
     if not groups:
-        raise SystemExit(f"Brak plików ARW w {args.input}")
+        raise SystemExit(f"Brak plików RAW w {args.input}")
 
     args.output.mkdir(parents=True, exist_ok=True)
 

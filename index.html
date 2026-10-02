@@ -26,12 +26,12 @@
   <h1>Photo Bracket Merge</h1>
   <p class="note">Wszystko liczy się w przeglądarce — zdjęcia nigdzie nie są wysyłane.</p>
 
-  <div id="drop">Upuść tu pliki .ARW albo kliknij, żeby wybrać</div>
-  <input id="picker" type="file" accept=".arw,.ARW" multiple hidden>
+  <div id="drop">Upuść tu pliki RAW (ARW, CR2, CR3, NEF, RAF, DNG, ORF, RW2, …) albo kliknij, żeby wybrać</div>
+  <input id="picker" type="file" multiple hidden>
 
   <div class="opts">
     <label>Zdjęć w jednym bracketcie: <input id="group" type="number" min="1" value="3" style="width: 4em"></label>
-    <label><input id="lens" type="checkbox"> Korekcja obiektywu (profil Sony z ARW)</label>
+    <label><input id="lens" type="checkbox"> Korekcja obiektywu (tylko Sony — profil z pliku ARW)</label>
     <label><input id="awb" type="checkbox"> Auto balans bieli</label>
   </div>
 

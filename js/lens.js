@@ -1,15 +1,22 @@
 // Korekcja obiektywu z profilu, który Sony zapisuje w każdym ARW (ten sam, którego aparat
 // używa do JPEG-ów). Port read_lens_profile / fill_scale / correct_lens z bracket_merge.py.
 
-const TAG_SUBIFDS = 0x014a, TAG_EXIF = 0x8769;
+const TAG_MAKE = 0x010f, TAG_SUBIFDS = 0x014a, TAG_EXIF = 0x8769;
 const TAG_VIGNETTING = 0x7032, TAG_CA = 0x7035, TAG_DISTORTION = 0x7037;
 const TYPE_SIZE = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8 };
 
-/** Czyta tagi 0x7032/0x7035/0x7037 z IFD-ów pliku ARW (TIFF). Zwraca null, jeśli ich nie ma. */
+/** Czyta tagi 0x7032/0x7035/0x7037 z IFD-ów pliku ARW (TIFF). Zwraca null, jeśli ich nie ma
+ * albo plik nie jest RAW-em Sony (inne formaty, np. CR3/RAF, nie są TIFF-ami, a w TIFF-ach
+ * innych producentów te numery tagów mogą znaczyć coś innego). */
 export function readLensProfile(arrayBuffer) {
   const dv = new DataView(arrayBuffer);
-  const le = dv.getUint16(0) === 0x4949;
+  if (dv.byteLength < 8) return null;
+  const order = dv.getUint16(0);
+  if (order !== 0x4949 && order !== 0x4d4d) return null;
+  const le = order === 0x4949;
   const u16 = (o) => dv.getUint16(o, le), u32 = (o) => dv.getUint32(o, le);
+  if (u16(2) !== 42) return null;
+  let make = "";
   const found = {};
   const seen = new Set();
 
@@ -32,16 +39,20 @@ export function readLensProfile(arrayBuffer) {
       const tag = u16(e), type = u16(e + 2), n = u32(e + 4);
       const size = (TYPE_SIZE[type] || 1) * n;
       const valOff = size <= 4 ? e + 8 : u32(e + 8);
-      if (![3, 4, 8, 9].includes(type) || valOff + size > dv.byteLength) continue;
-      if (tag === TAG_VIGNETTING || tag === TAG_CA || tag === TAG_DISTORTION) {
+      if (![2, 3, 4, 8, 9].includes(type) || valOff + size > dv.byteLength) continue;
+      if (tag === TAG_MAKE && depth === 0 && type === 2) {
+        make = new TextDecoder().decode(new Uint8Array(arrayBuffer, valOff, n)).replace(/\0.*$/, "");
+      } else if (tag === TAG_VIGNETTING || tag === TAG_CA || tag === TAG_DISTORTION) {
         found[tag] ??= readValues(type, n, valOff);
       } else if (tag === TAG_SUBIFDS || tag === TAG_EXIF) {
         for (const sub of readValues(type, n, valOff)) walk(sub, depth + 1);
       }
     }
-    walk(u32(off + 2 + count * 12), depth);
+    const next = off + 2 + count * 12;
+    if (next + 4 <= dv.byteLength) walk(u32(next), depth);
   };
   walk(u32(4), 0);
+  if (!make.toUpperCase().startsWith("SONY")) return null;
 
   const curve = (tag, parts = 1) => {
     const v = found[tag];

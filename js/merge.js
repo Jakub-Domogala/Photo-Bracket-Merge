@@ -7,8 +7,8 @@ import { readLensProfile, correctLens } from "./lens.js";
 // Ustawienia jak rawpy.postprocess w wersji Python (gamma i tak jest odwracana w linearize)
 const DECODE_SETTINGS = { useCameraWb: true, noAutoBright: true, outputBps: 16, outputColor: 1 };
 
-/** Dekoduje ARW modułem LibRaw (libraw-wasm) do liniowego, planarnego BGR. */
-export function decodeArw(LibRawModule, buffer) {
+/** Dekoduje plik RAW modułem LibRaw (libraw-wasm) do liniowego, planarnego BGR. */
+export function decodeRaw(LibRawModule, buffer) {
   const raw = new LibRawModule.LibRaw();
   try {
     raw.open(new Uint8Array(buffer), DECODE_SETTINGS);
@@ -31,7 +31,7 @@ export function mergeBracket(LibRawModule, files, opts = {}, progress = () => {}
   let width, height;
   for (const [i, f] of files.entries()) {
     progress(`Dekodowanie ${f.name} (${i + 1}/${files.length})`);
-    let img = decodeArw(LibRawModule, f.buffer);
+    let img = decodeRaw(LibRawModule, f.buffer);
     if (width === undefined) ({ width, height } = img);
     else if (img.width !== width || img.height !== height) throw new Error(`${f.name}: inny rozmiar niż reszta bracketu`);
     if (opts.lensCorrection) {

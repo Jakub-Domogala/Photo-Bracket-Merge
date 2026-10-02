@@ -1,6 +1,6 @@
 """Porównuje wynik pipeline'u JS (tests/run_js.mjs) z referencją Python (reference/bracket_merge.py).
 
-Użycie: python tests/compare.py <folder_z_arw> <wynik_js_bez_rozszerzenia> [--lens-correction] [--auto-wb]
+Użycie: python tests/compare.py <folder_z_raw> <wynik_js_bez_rozszerzenia> [--lens-correction] [--auto-wb]
 """
 import json
 import sys
@@ -9,10 +9,10 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "reference"))
-from bracket_merge import merge  # noqa: E402
+from bracket_merge import RAW_EXTENSIONS, merge  # noqa: E402
 
 folder, js_out, *flags = sys.argv[1:]
-paths = sorted(p for p in Path(folder).iterdir() if p.suffix.lower() == ".arw")
+paths = sorted(p for p in Path(folder).iterdir() if p.suffix.lower() in RAW_EXTENSIONS)
 ref = merge(paths, 1.0, 1.0, 1.0, auto_wb="--auto-wb" in flags, lens_correction="--lens-correction" in flags)
 ref = (ref * 255).round().astype(np.uint8)[..., ::-1]  # BGR -> RGB
 
