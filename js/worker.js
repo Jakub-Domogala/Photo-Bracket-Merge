@@ -8,6 +8,15 @@ import { mergeBracket } from "./merge.js";
 const JPEG_QUALITY = 0.95;
 const modulePromise = factory();
 
+async function decodeJpeg(bytes) {
+  const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }), { colorSpaceConversion: "none" });
+  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  return ctx.getImageData(0, 0, canvas.width, canvas.height);
+}
+
 async function encodeJpeg(rgba, width, height) {
   const canvas = new OffscreenCanvas(width, height);
   canvas.getContext("2d").putImageData(new ImageData(rgba, width, height), 0, 0);
@@ -22,7 +31,7 @@ self.onmessage = async ({ data: { groups, opts } }) => {
       const progress = (text) => self.postMessage({ type: "progress", text: prefix + text });
       // setTimeout pozwala wiadomościom o postępie wyjść przed kolejnym długim krokiem
       await new Promise((r) => setTimeout(r));
-      const { rgba, width, height, warnings } = mergeBracket(LibRaw, group, opts, progress);
+      const { rgba, width, height, warnings } = await mergeBracket(LibRaw, group, { ...opts, decodeJpeg }, progress);
       progress("Zapisywanie JPEG");
       const blob = await encodeJpeg(rgba, width, height);
       const name = `${group[0].name.replace(/\.[^.]+$/, "")}_${group.at(-1).name.replace(/\.[^.]+$/, "")}.jpg`;

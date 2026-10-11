@@ -103,6 +103,22 @@ const reflect = (p, len) => {
   return p;
 };
 
+const cubicX = new Float64Array(4), cubicY = new Float64Array(4);
+
+/** Próbka jak cv2.remap(INTER_CUBIC, BORDER_REFLECT) w pozycji (mx, my) (float32). */
+export function sampleCubic(src, w, h, mx, my) {
+  const ix = Math.floor(mx), iy = Math.floor(my);
+  cubicWeights(mx - ix, cubicX);
+  cubicWeights(my - iy, cubicY);
+  const x0 = reflect(ix - 1, w), x1 = reflect(ix, w), x2 = reflect(ix + 1, w), x3 = reflect(ix + 2, w);
+  let acc = 0;
+  for (let m = 0; m < 4; m++) {
+    const row = reflect(iy - 1 + m, h) * w;
+    acc += cubicY[m] * (cubicX[0] * src[row + x0] + cubicX[1] * src[row + x1] + cubicX[2] * src[row + x2] + cubicX[3] * src[row + x3]);
+  }
+  return acc;
+}
+
 /** Stosuje profil do liniowego obrazu {b, g, r} (w miejscu zwraca nowe kanały). */
 export function correctLens(img, profile, width, height) {
   const w = width, h = height, n = w * h;
@@ -136,7 +152,6 @@ export function correctLens(img, profile, width, height) {
   };
 
   const out = {};
-  const wx = new Float64Array(4), wy = new Float64Array(4);
   for (const c of ["b", "g", "r"]) {
     const src = img[c], dst = new Float32Array(n), sc = scales[c];
     for (let y = 0; y < h; y++) {
@@ -144,16 +159,7 @@ export function correctLens(img, profile, width, height) {
       for (let x = 0; x < w; x++) {
         const dx = f32(x - cx);
         const s = f32(interpKnots(sc, radius(x, y)));
-        const mx = f32(cx + f32(dx * s)), my = f32(cy + f32(dy * s));
-        const ix = Math.floor(mx), iy = Math.floor(my);
-        cubicWeights(mx - ix, wx);
-        cubicWeights(my - iy, wy);
-        const x0 = reflect(ix - 1, w), x1 = reflect(ix, w), x2 = reflect(ix + 1, w), x3 = reflect(ix + 2, w);
-        let acc = 0;
-        for (let m = 0; m < 4; m++) {
-          const row = reflect(iy - 1 + m, h) * w;
-          acc += wy[m] * (wx[0] * src[row + x0] + wx[1] * src[row + x1] + wx[2] * src[row + x2] + wx[3] * src[row + x3]);
-        }
+        const acc = sampleCubic(src, w, h, f32(cx + f32(dx * s)), f32(cy + f32(dy * s)));
         dst[y * w + x] = acc > 0 ? acc : 0;
       }
     }

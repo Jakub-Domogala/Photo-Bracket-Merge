@@ -5,13 +5,18 @@ import path from "path";
 import factory from "../vendor/libraw-wasm/libraw.js";
 import { mergeBracket } from "../js/merge.js";
 import { isRaw } from "../js/formats.js";
+import { createRequire } from "module";
+
+const decodeJpegJs = createRequire(import.meta.url)("./vendor/jpeg-js-decoder.cjs");
+const decodeJpeg = async (bytes) => decodeJpegJs(bytes, { useTArray: true, maxMemoryUsageInMB: 2048 });
 
 const [dir, out, ...flags] = process.argv.slice(2);
 const M = await factory({ wasmBinary: fs.readFileSync(new URL("../vendor/libraw-wasm/libraw.wasm", import.meta.url)) });
 const files = fs.readdirSync(dir).filter(isRaw).sort()
   .map((name) => { const b = fs.readFileSync(path.join(dir, name)); return { name, buffer: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }; });
 const t0 = Date.now();
-const { rgba, width, height, warnings } = mergeBracket(M, files, {
+const { rgba, width, height, warnings } = await mergeBracket(M, files, {
+  decodeJpeg,
   lensCorrection: flags.includes("--lens-correction"), autoWb: flags.includes("--auto-wb"),
 });
 warnings.forEach((w) => console.warn(w));

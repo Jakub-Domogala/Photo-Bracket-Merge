@@ -145,6 +145,227 @@ def correct_lens(img: np.ndarray, profile: dict) -> np.ndarray:
     return np.clip(out, 0, None)
 
 
+# --- korekcja z podglądu JPEG zapisanego w RAW (aparaty bez profilu Sony) ---
+# Aparaty (zwłaszcza kompakty, np. Canon G7 X) prostują dystorsję i winietę tylko w swoich
+# JPEG-ach; RAW zostaje surowy, a producent nie zapisuje w nim współczynników. Pełnowymiarowy
+# podgląd w pliku RAW to właśnie ten poprawiony JPEG, więc mierzymy z niego, gdzie w surowym
+# obrazie leży każdy punkt kadru aparatu, i odtwarzamy to samo przekształcenie.
+# Model: raw = c + (d / R) * (q0 + q1 r² + q2 r⁴ ...), gdzie d = punkt podglądu - środek
+# podglądu, R = pół przekątnej podglądu, r = |d| / R.
+
+PREVIEW_MIN_SCALE = 0.75   # podgląd musi mieć co najmniej tyle szerokości RAW-a
+MATCH_LEVELS = (           # (zmniejszenie, pół-bok łaty, zasięg szukania, wyrazy modelu, min. NCC)
+    (16, 8, 28, 2, 0.8),
+    (4, 12, 6, 3, 0.85),
+    (2, 12, 3, 3, 0.85),
+)
+MIN_TEXTURE = 0.015        # min. odchylenie std łaty podglądu (płaskie ściany nic nie mówią)
+MIN_MATCHES = 50
+MAX_FIT_ERROR = 1.5        # maks. mediana błędu dopasowania (piksele pełnej rozdzielczości)
+VIG_FACTOR = 8             # winieta: porównanie na obrazach zmniejszonych tyle razy
+VIG_RINGS, VIG_LEVELS = 10, 16
+VIG_MIN_V, VIG_MAX_V = 0.08, 0.92  # zakres jasności podglądu (bez czerni i przepaleń)
+VIG_MAX_GAIN = 4.0
+
+
+def rotate_flip(img: np.ndarray, flip: int) -> np.ndarray:
+    """Obraca podgląd tak jak LibRaw obraca wynik (3 = 180°, 5 = 90° w lewo, 6 = 90° w prawo)."""
+    if flip == 3:
+        return np.ascontiguousarray(img[::-1, ::-1])
+    if flip == 5:
+        return np.ascontiguousarray(np.rot90(img, 1))
+    if flip == 6:
+        return np.ascontiguousarray(np.rot90(img, -1))
+    return img
+
+
+def load_preview(path: Path):
+    """Podgląd JPEG z pliku RAW jako BGR uint8 w orientacji wyniku LibRaw; None, jeśli go nie ma."""
+    with rawpy.imread(str(path)) as raw:
+        try:
+            thumb = raw.extract_thumb()
+        except (rawpy.LibRawNoThumbnailError, rawpy.LibRawUnsupportedThumbnailError):
+            return None
+        flip = raw.sizes.flip
+    if thumb.format != rawpy.ThumbFormat.JPEG:
+        return None
+    img = cv2.imdecode(np.frombuffer(thumb.data, np.uint8), cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION)
+    return None if img is None else rotate_flip(img, flip)
+
+
+def box_down(img: np.ndarray, f: int) -> np.ndarray:
+    h, w = img.shape[0] // f, img.shape[1] // f
+    return img[:h * f, :w * f].reshape(h, f, w, f).mean((1, 3), dtype=np.float32)
+
+
+def lens_map(sol, x, y, cp, R):
+    """Punkt podglądu (x, y) -> pozycja w surowym obrazie."""
+    dx, dy = (x - cp[0]) / R, (y - cp[1]) / R
+    r2 = dx * dx + dy * dy
+    s = sum(q * r2 ** j for j, q in enumerate(sol[2:]))
+    return sol[0] + dx * s, sol[1] + dy * s
+
+
+def parabola_peak(a: float, b: float, c: float) -> float:
+    d = a - 2 * b + c
+    return 0.0 if d >= 0 else 0.5 * (a - c) / d
+
+
+def match_points(pairs, sol, cp, R, f, P, S, min_ncc) -> np.ndarray:
+    """Dopasowuje łaty podglądu do surowego obrazu wokół pozycji przewidzianej przez model.
+    Zwraca N×4: (x, y) w podglądzie, (x, y) w RAW — w pikselach pełnej rozdzielczości."""
+    o = (f - 1) / 2
+    pts = []
+    for graw, gprev in pairs:
+        rd, pd = box_down(graw, f), box_down(gprev, f)
+        for y in range(P, pd.shape[0] - P, 2 * P):
+            for x in range(P, pd.shape[1] - P, 2 * P):
+                patch = pd[y - P:y + P + 1, x - P:x + P + 1]
+                if patch.std() < MIN_TEXTURE:
+                    continue
+                px, py = x * f + o, y * f + o
+                rx, ry = lens_map(sol, px, py, cp, R)
+                ix, iy = int(np.floor((rx - o) / f + 0.5)), int(np.floor((ry - o) / f + 0.5))
+                if ix - P - S < 0 or iy - P - S < 0 or ix + P + S >= rd.shape[1] or iy + P + S >= rd.shape[0]:
+                    continue
+                win = rd[iy - P - S:iy + P + S + 1, ix - P - S:ix + P + S + 1]
+                res = cv2.matchTemplate(win, patch, cv2.TM_CCOEFF_NORMED)
+                _, best, _, (lx, ly) = cv2.minMaxLoc(res)
+                if best < min_ncc or lx in (0, 2 * S) or ly in (0, 2 * S):
+                    continue
+                sx = parabola_peak(res[ly, lx - 1], res[ly, lx], res[ly, lx + 1])
+                sy = parabola_peak(res[ly - 1, lx], res[ly, lx], res[ly + 1, lx])
+                pts.append((px, py, (ix - S + lx + sx) * f + o, (iy - S + ly + sy) * f + o))
+    return np.array(pts, np.float64).reshape(-1, 4)
+
+
+def fit_lens_model(pts, cp, R, terms, tol):
+    """Odporne najmniejsze kwadraty (odrzuca punkty > 3× mediana błędu). Zwraca (sol, mediana błędu)."""
+    d = (pts[:, :2] - cp) / R
+    r2 = (d ** 2).sum(1)
+    A = np.zeros((2 * len(pts), 2 + terms))
+    A[0::2, 0] = 1
+    A[1::2, 1] = 1
+    for j in range(terms):
+        A[0::2, 2 + j] = d[:, 0] * r2 ** j
+        A[1::2, 2 + j] = d[:, 1] * r2 ** j
+    b = pts[:, 2:].ravel()
+    keep = np.ones(len(pts), bool)
+    for _ in range(6):
+        if keep.sum() < 12:
+            return None, None
+        k2 = np.repeat(keep, 2)
+        sol = np.linalg.solve(A[k2].T @ A[k2], A[k2].T @ b[k2])
+        err = np.hypot(*(A @ sol - b).reshape(-1, 2).T)
+        keep = err < max(3 * float(np.median(err[keep])), tol)
+    return sol, float(np.median(err[keep]))
+
+
+def ring_gain_curve(samples):
+    """Dopasowuje log(spadek światła) = b1 r² + b2 r⁴ i zwraca (b1, b2) albo (0, 0)."""
+    if len({rb for rb, *_ in samples if rb >= 5}) < 3:
+        return 0.0, 0.0
+    r = np.array([s[1] for s in samples])
+    y = np.array([s[2] for s in samples])
+    w = np.array([s[3] for s in samples])
+    A = np.stack([r ** 2, r ** 4], 1)
+    return tuple(float(v) for v in np.linalg.solve((A * w[:, None]).T @ A, (A * w[:, None]).T @ y))
+
+
+def bilinear(img: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    h, w = img.shape
+    x = np.clip(x, 0, w - 1)
+    y = np.clip(y, 0, h - 1)
+    x0 = np.minimum(np.floor(x).astype(int), w - 2)
+    y0 = np.minimum(np.floor(y).astype(int), h - 2)
+    fx, fy = x - x0, y - y0
+    return ((img[y0, x0] * (1 - fx) + img[y0, x0 + 1] * fx) * (1 - fy)
+            + (img[y0 + 1, x0] * (1 - fx) + img[y0 + 1, x0 + 1] * fx) * fy)
+
+
+def fit_vignetting(lin_grays, prev_grays, sol, cp, R):
+    """Spadek światła na brzegach, który aparat skorygował w podglądzie. Dla pikseli o tej samej
+    jasności w podglądzie porównujemy RAW w kolejnych pierścieniach ze środkiem kadru — krzywa
+    tonalna aparatu się wtedy skraca."""
+    f, o = VIG_FACTOR, (VIG_FACTOR - 1) / 2
+    samples = []  # (pierścień, średni promień, log(spadek), waga)
+    for lin, prev in zip(lin_grays, prev_grays):
+        pd, rd = box_down(prev, f), box_down(lin, f)
+        yy, xx = np.mgrid[0:pd.shape[0], 0:pd.shape[1]].astype(np.float64)
+        px, py = xx * f + o, yy * f + o
+        rx, ry = lens_map(sol, px, py, cp, R)
+        g = bilinear(rd, (rx - o) / f, (ry - o) / f).ravel()
+        r = (np.hypot(px - cp[0], py - cp[1]) / R).ravel()
+        v = pd.ravel()
+        ring = np.minimum((r * VIG_RINGS).astype(int), VIG_RINGS - 1)
+        valid = (v >= VIG_MIN_V) & (v < VIG_MAX_V) & (g > 0)
+        level = ((v - VIG_MIN_V) / (VIG_MAX_V - VIG_MIN_V) * VIG_LEVELS).astype(int)
+        for lv in range(VIG_LEVELS):
+            sel = valid & (level == lv)
+            center = sel & (ring < 3)
+            if center.sum() < 50:
+                continue
+            ref = float(np.median(g[center]))
+            for rb in range(3, VIG_RINGS):
+                cell = sel & (ring == rb)
+                n = int(cell.sum())
+                if n >= 30:
+                    samples.append((rb, float(r[cell].mean()), float(np.log(np.median(g[cell]) / ref)), n))
+    return ring_gain_curve(samples)
+
+
+def fit_preview_correction(frames, previews):
+    """Mierzy korekcję aparatu z podglądów całego bracketu. Zwraca słownik albo None."""
+    hr, wr = frames[0].shape[:2]
+    if any(p is None for p in previews) or len({p.shape for p in previews}) != 1:
+        return None
+    hp, wp = previews[0].shape[:2]
+    if wp < PREVIEW_MIN_SCALE * wr or hp < PREVIEW_MIN_SCALE * hr:
+        return None
+    cp = np.array([(wp - 1) / 2, (hp - 1) / 2])
+    R = float(np.hypot(*cp))
+    lin_grays = [img.mean(-1) for img in frames]
+    raw_grays = [to_srgb(g / max(float(np.percentile(g, 99)), 1e-6)) for g in lin_grays]
+    prev_grays = [p.astype(np.float32).mean(-1) / 255 for p in previews]
+    pairs = list(zip(raw_grays, prev_grays))
+
+    sol = np.array([(wr - 1) / 2, (hr - 1) / 2, wr / wp * R])
+    err = None
+    for f, P, S, terms, min_ncc in MATCH_LEVELS:
+        pts = match_points(pairs, sol, cp, R, f, P, S, min_ncc)
+        if len(pts) < MIN_MATCHES:
+            return None
+        sol, err = fit_lens_model(pts, cp, R, terms, 0.25 * f)
+        if sol is None:
+            return None
+    if err > MAX_FIT_ERROR:
+        return None
+    vig = fit_vignetting(lin_grays, prev_grays, sol, cp, R)
+    scale = sol[2] / R  # pikseli RAW na piksel podglądu w środku kadru
+    if abs(scale - 1) < 0.03:
+        scale = 1.0
+    return {"sol": sol, "cp": cp, "R": R, "scale": scale, "vig": vig,
+            "size": (int(round(wp * scale)), int(round(hp * scale))), "error": err}
+
+
+def apply_preview_correction(img: np.ndarray, geo: dict) -> np.ndarray:
+    """Przekształca liniowy obraz do kadru aparatu i wyrównuje winietę."""
+    w, h = geo["size"]
+    cp, R, scale = geo["cp"], geo["R"], geo["scale"]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+    px = cp[0] + (xx - (w - 1) / 2) / scale
+    py = cp[1] + (yy - (h - 1) / 2) / scale
+    mx, my = lens_map(geo["sol"], px, py, cp, R)
+    mx, my = mx.astype(np.float32), my.astype(np.float32)
+    r2 = (((px - cp[0]) ** 2 + (py - cp[1]) ** 2) / (R * R))
+    b1, b2 = geo["vig"]
+    gain = np.clip(np.exp(-(b1 * r2 + b2 * r2 * r2)), 1.0, VIG_MAX_GAIN).astype(np.float32)
+    out = np.empty((h, w, 3), np.float32)
+    for c in range(3):
+        out[..., c] = cv2.remap(img[..., c], mx, my, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT) * gain
+    return np.clip(out, 0, None)
+
+
 def auto_exposure(linear: list, key: float) -> list:
     """Jedno wzmocnienie dla wszystkich klatek (zachowuje odstępy EV), liczone ze środkowej
     pod względem jasności (a nie kolejności plików — Sony domyślnie robi 0, -, +)."""
@@ -196,20 +417,26 @@ def finish(srgb: np.ndarray) -> np.ndarray:
     return out * (1 - w) + t[..., None] * w
 
 
-def load_frame(path: Path, lens_correction: bool) -> np.ndarray:
-    img = load_raw(path)
-    if lens_correction:
-        profile = read_lens_profile(path)
-        if profile is None:
-            print(f"  Uwaga: {path.name} nie ma profilu obiektywu, pomijam korekcję.")
-        else:
-            img = correct_lens(img, profile)
-    return img
+def load_bracket(paths, lens_correction: bool) -> list:
+    """Liniowe klatki bracketu; z korekcją obiektywu: profil Sony z ARW, a gdy go nie ma —
+    korekcja zmierzona z podglądu JPEG w pliku RAW."""
+    frames = [load_raw(p) for p in paths]
+    if not lens_correction:
+        return frames
+    profiles = [read_lens_profile(p) for p in paths]
+    if all(pr is not None for pr in profiles):
+        return [correct_lens(img, pr) for img, pr in zip(frames, profiles)]
+    geo = fit_preview_correction(frames, [load_preview(p) for p in paths])
+    if geo is None:
+        print(f"  Uwaga: {paths[0].name}…: brak profilu obiektywu i nie udało się zmierzyć korekcji "
+              f"z podglądu, pomijam korekcję.")
+        return frames
+    return [apply_preview_correction(img, geo) for img in frames]
 
 
 def merge(paths, contrast, saturation, exposure, key=KEY, auto_wb=False,
           lens_correction=False) -> np.ndarray:
-    imgs = auto_exposure([load_frame(p, lens_correction) for p in paths], key)
+    imgs = auto_exposure(load_bracket(paths, lens_correction), key)
     fusion = cv2.createMergeMertens(
         contrast_weight=contrast,
         saturation_weight=saturation,
