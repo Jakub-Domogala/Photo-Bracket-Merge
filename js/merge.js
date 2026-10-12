@@ -6,6 +6,7 @@ import { correctLens } from "./lens.js";
 import { fitPreviewCorrection, previewCorrectionMap, applyPreviewCorrection, rawGray } from "./previewLens.js";
 import { InlineExec } from "./exec.js";
 import { getGpu, gpuMerge } from "./gpu.js";
+import { alignPlan, alignFrames, MAX_CROP } from "./align.js";
 
 /**
  * @param files     [{ name, buffer: ArrayBuffer }] — klatki jednego bracketu (bufory są przekazywane
@@ -56,6 +57,9 @@ export async function mergeBracket(files, opts = {}, progress = () => {}) {
   }
   if (lens?.geo) ({ width, height } = lens.geo);
   const key = opts.key ?? KEY;
+  const alignWarning = (plan) => {
+    if (plan?.tooBig) warnings.push(`${files[0].name}…: klatki są przesunięte za bardzo (przycięcie > ${MAX_CROP * 100} %), pominięto wyrównanie.`);
+  };
 
   // korekcja + auto-ekspozycja + Mertens: na GPU, jeśli jest, inaczej (albo po błędzie) na CPU
   let result = null, gpuUsed = false;
@@ -63,7 +67,13 @@ export async function mergeBracket(files, opts = {}, progress = () => {}) {
   if (gpu) {
     progress("Korekcja obiektywu (GPU)");
     try {
-      result = await gpuMerge(gpu, frames, lens, key, (n) => exec.f32(n), progress);
+      const align = async (grays, w, h) => {
+        const plan = await alignPlan(exec, grays, w, h);
+        exec.release(...grays);
+        alignWarning(plan);
+        return plan;
+      };
+      ({ result, width, height } = await gpuMerge(gpu, frames, lens, key, align, (n) => exec.f32(n), progress));
       gpuUsed = true;
       for (const img of frames) exec.release(img.b, img.g, img.r);
     } catch (err) {
@@ -80,6 +90,11 @@ export async function mergeBracket(files, opts = {}, progress = () => {}) {
       if (lens) exec.release(img.b, img.g, img.r);
     }
     if (map) exec.release(map.mapX, map.mapY, map.gain);
+    progress("Wyrównywanie klatek");
+    const aligned = await alignFrames(exec, frames, width, height);
+    alignWarning(aligned.plan);
+    frames = aligned.frames;
+    if (aligned.plan?.shifts) ({ w: width, h: height } = aligned.plan);
     progress("Auto-ekspozycja");
     await autoExposure(exec, frames, key);
     result = await mergeMertens(exec, frames, width, height, {}, progress);

@@ -6,6 +6,7 @@ import * as P from "./pipeline.js";
 import { sonyVignetteRows, sonyRemapRows } from "./lens.js";
 import { matchPair, vignetteSamples, previewMapRows, previewRemapRows } from "./previewLens.js";
 import { decodeRaw } from "./decode.js";
+import { logGrayRows, down2Rows, codeRows, shiftErrorRows, cropRows } from "./align.js";
 
 const shared = (n) => new Float32Array(new SharedArrayBuffer(n * 4));
 
@@ -36,6 +37,11 @@ export const kernels = {
   previewMap: previewMapRows,
   previewRemap: previewRemapRows,
   matchPair,
+  logGray: logGrayRows,
+  down2: down2Rows,
+  code: codeRows,
+  shiftError: shiftErrorRows,
+  crop: cropRows,
   vignetteSamples,
   // w workerze wynik trafia do pamięci współdzielonej, w bieżącym wątku — do zwykłej
   decode: (args) => decodeRaw(args, args.shared ? shared : (n) => new Float32Array(n)),

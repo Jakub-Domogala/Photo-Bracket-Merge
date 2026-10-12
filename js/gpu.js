@@ -271,6 +271,22 @@ ${ID2}
   d[i] += up_s(x, y, i32(p.sw), i32(p.sh));
 }`,
   },
+  logGray: {
+    fields: [["u32", "n"]],
+    body: (u) => `${u}
+${ro(1, "b")} ${ro(2, "g")} ${ro(3, "r")} ${rw(4, "out")}
+${ID1}
+  out[i] = log(max((b[i] + g[i] + r[i]) / 3.0, 1e-6));
+}`,
+  },
+  crop: {
+    fields: [["u32", "w"], ["u32", "h"], ["u32", "sw"], ["u32", "x0"], ["u32", "y0"]],
+    body: (u) => `${u}
+${ro(1, "src")} ${rw(2, "dst")}
+${ID2}
+  dst[i] = src[(u32(y) + p.y0) * p.sw + u32(x) + p.x0];
+}`,
+  },
   clip: {
     fields: [["u32", "n"]],
     body: (u) => `${u}
@@ -471,10 +487,11 @@ function pyramid(gpu, base, w, h, maxlevel) {
  * Korekcja obiektywu + auto-ekspozycja + Mertens na GPU.
  * @param frames  liniowe klatki CPU {b, g, r, width, height} (nie są zmieniane)
  * @param lens    null | { profiles } (Sony) | { geo } (z podglądu)
+ * @param align   async (log-szarości klatek, w, h) => plan z alignPlan() (js/align.js)
  * @param alloc   (n) => Float32Array na wynik
- * @returns       { b, g, r } — sRGB 0..1 po fuzji (jak mergeMertens)
+ * @returns       { result: { b, g, r } — sRGB 0..1 po fuzji (jak mergeMertens), width, height }
  */
-export async function gpuMerge(gpu, frames, lens, key, alloc, progress = () => {}) {
+export async function gpuMerge(gpu, frames, lens, key, align, alloc, progress = () => {}) {
   const { device } = gpu;
   device.pushErrorScope("out-of-memory");
   device.pushErrorScope("validation");
@@ -482,16 +499,41 @@ export async function gpuMerge(gpu, frames, lens, key, alloc, progress = () => {
   let w = sw, h = sh;
   if (lens?.geo) ({ width: w, height: h } = lens.geo);
   if (Math.max(sw * sh, w * h) > gpu.maxFloats) throw new Error("obraz za duży dla GPU");
-  const n = w * h;
+  let n = w * h;
   try {
     // korekcja obiektywu
-    const imgs = [];
+    let imgs = [];
     for (const [k, f] of frames.entries()) {
       let g = { b: gpu.upload(f.b), g: gpu.upload(f.g), r: gpu.upload(f.r) };
       if (lens?.profiles) g = sonyLens(gpu, g, lens.profiles[k], w, h);
       else if (lens?.geo) g = previewLens(gpu, g, lens.geo, sw, sh);
       gpu.submit();
       imgs.push(g);
+    }
+
+    // wyrównanie przesuniętych klatek: szarości liczy GPU, przesunięcia — CPU
+    progress("Wyrównywanie klatek (GPU)");
+    const grays = [];
+    for (const g of imgs) {
+      const lg = gpu.buf(n);
+      gpu.run("logGray", { n }, [g.b, g.g, g.r, lg], n);
+      grays.push(await gpu.read(lg, alloc(n)));
+      gpu.release(lg);
+    }
+    const plan = await align(grays, w, h);
+    if (plan?.shifts) {
+      imgs = imgs.map((g, k) => {
+        const [sx, sy] = plan.shifts[k];
+        const out = {};
+        for (const c of ["b", "g", "r"]) {
+          out[c] = gpu.buf(plan.w * plan.h);
+          gpu.run("crop", { w: plan.w, h: plan.h, sw: w, x0: plan.x0 + sx, y0: plan.y0 + sy }, [g[c], out[c]], [plan.w, plan.h]);
+        }
+        gpu.release(g.b, g.g, g.r);
+        return out;
+      });
+      ({ w, h } = plan);
+      n = w * h;
     }
 
     // auto-ekspozycja (wspólne wzmocnienie)
@@ -555,7 +597,7 @@ export async function gpuMerge(gpu, frames, lens, key, alloc, progress = () => {
       out[c] = await gpu.read(pyr[0].buf, alloc(n));
       gpu.release(...pyr.map((p) => p.buf));
     }
-    return out;
+    return { result: out, width: w, height: h };
   } finally {
     gpu.submit();
     const errors = [await device.popErrorScope(), await device.popErrorScope()].filter(Boolean);

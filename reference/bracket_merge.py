@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 Łączy brackety RAW (ARW, CR2/CR3, NEF, RAF, DNG, ORF, RW2, …) w jedno zdjęcie metodą exposure fusion (Mertens).
-Zakłada statyw i brak ruchu w kadrze, więc nie wykonuje wyrównywania.
+Klatki przesunięte między zdjęciami są wyrównywane (tylko przesunięcie, bez obrotu) kosztem
+przycięcia kadru o najwyżej 3 %.
 
 Pipeline (bez ręcznego strojenia per zdjęcie):
   1. RAW -> liniowe RGB (16 bit, balans bieli z aparatu); opcjonalnie (--lens-correction)
      korekcja obiektywu z profilu Sony zapisanego w ARW (dystorsja, winieta, aberracja)
+     i wyrównanie przesuniętych klatek (mapy progu medianowego, przycięcie do wspólnej części)
   2. auto-ekspozycja: wspólne wzmocnienie dla całego bracketu tak, żeby
      środkowa klatka miała średnią jasność (log-average) = KEY
   3. exposure fusion (Mertens) na klatkach w sRGB
@@ -366,6 +368,72 @@ def apply_preview_correction(img: np.ndarray, geo: dict) -> np.ndarray:
     return np.clip(out, 0, None)
 
 
+MAX_CROP = 0.03    # wyrównanie przesuniętych klatek może przyciąć kadr najwyżej o tyle (z każdej osi)
+ALIGN_TOL = 0.05   # piksele tak bliskie medianie (log jasności) nie liczą się przy porównaniu
+
+
+def down2(g: np.ndarray) -> np.ndarray:
+    h, w = g.shape[0] // 2 * 2, g.shape[1] // 2 * 2
+    return (g[0:h:2, 0:w:2] + g[1:h:2, 0:w:2] + g[0:h:2, 1:w:2] + g[1:h:2, 1:w:2]) / np.float32(4)
+
+
+def threshold_codes(g: np.ndarray, med: float) -> np.ndarray:
+    """Mapa progu medianowego (Ward 2003): 2 = jaśniej niż mediana, 1 = ciemniej, 0 = za blisko
+    mediany. Nie zależy od ekspozycji, więc da się porównywać klatki -2 i +2 EV."""
+    return np.where(np.abs(g - med) <= ALIGN_TOL, 0, np.where(g > med, 2, 1)).astype(np.uint8)
+
+
+def shift_error(a: np.ndarray, b: np.ndarray, sx: int, sy: int) -> int:
+    """Liczba pikseli, gdzie a[y, x] i b[y + sy, x + sx] leżą po różnych stronach mediany."""
+    h, w = a.shape
+    a = a[max(0, -sy):min(h, h - sy), max(0, -sx):min(w, w - sx)]
+    b = b[max(0, sy):min(h, h + sy), max(0, sx):min(w, w + sx)]
+    return int(np.count_nonzero((a != 0) & (b != 0) & (a != b)))
+
+
+def find_shift(ref_pyr: list, pyr: list) -> tuple:
+    """Przesunięcie od najmniejszego poziomu piramidy: na każdym ±1 piksel wokół podwojonego."""
+    sx = sy = 0
+    for a, b in zip(reversed(ref_pyr), reversed(pyr)):
+        best = None
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                e = shift_error(a, b, 2 * sx + dx, 2 * sy + dy)
+                if best is None or e < best[0]:
+                    best = (e, 2 * sx + dx, 2 * sy + dy)
+        _, sx, sy = best
+    return sx, sy
+
+
+def align_frames(frames: list, name: str) -> list:
+    """Wyrównuje klatki przesunięte między zdjęciami (bez obrotu) do klatki o środkowej
+    jasności i przycina do wspólnej części — najwyżej o MAX_CROP, inaczej zostawia bez zmian."""
+    h, w = frames[0].shape[:2]
+    levels = int(np.ceil(np.log2(MAX_CROP * max(w, h) + 1))) - 1
+    while levels > 0 and min(w, h) >> levels < 32:
+        levels -= 1
+    pyrs, means = [], []
+    for img in frames:
+        g = np.log(np.maximum(img.mean(-1), np.float32(1e-6)))
+        means.append(float(g.mean(dtype=np.float64)))
+        pyr = [g]
+        for _ in range(levels):
+            pyr.append(down2(pyr[-1]))
+        med = np.percentile(g, 50)  # mediana pełnej rozdzielczości dla wszystkich poziomów
+        pyrs.append([threshold_codes(p, med) for p in pyr])
+    ref = sorted(range(len(frames)), key=lambda k: means[k])[len(frames) // 2]
+    shifts = [(0, 0) if k == ref else find_shift(pyrs[ref], pyrs[k]) for k in range(len(frames))]
+    if not any(sx or sy for sx, sy in shifts):
+        return frames
+    x0, x1 = max(0, *(-sx for sx, _ in shifts)), min(w, *(w - sx for sx, _ in shifts))
+    y0, y1 = max(0, *(-sy for _, sy in shifts)), min(h, *(h - sy for _, sy in shifts))
+    if x1 - x0 < (1 - MAX_CROP) * w or y1 - y0 < (1 - MAX_CROP) * h:
+        print(f"  Uwaga: {name}…: klatki są przesunięte za bardzo (przycięcie > {MAX_CROP:.0%}), "
+              f"pomijam wyrównanie.")
+        return frames
+    return [img[y0 + sy:y1 + sy, x0 + sx:x1 + sx] for img, (sx, sy) in zip(frames, shifts)]
+
+
 def auto_exposure(linear: list, key: float) -> list:
     """Jedno wzmocnienie dla wszystkich klatek (zachowuje odstępy EV), liczone ze środkowej
     pod względem jasności (a nie kolejności plików — Sony domyślnie robi 0, -, +)."""
@@ -436,7 +504,7 @@ def load_bracket(paths, lens_correction: bool) -> list:
 
 def merge(paths, contrast, saturation, exposure, key=KEY, auto_wb=False,
           lens_correction=False) -> np.ndarray:
-    imgs = auto_exposure(load_bracket(paths, lens_correction), key)
+    imgs = auto_exposure(align_frames(load_bracket(paths, lens_correction), paths[0].name), key)
     fusion = cv2.createMergeMertens(
         contrast_weight=contrast,
         saturation_weight=saturation,
