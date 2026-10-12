@@ -119,28 +119,48 @@ export function sampleCubic(src, w, h, mx, my) {
   return acc;
 }
 
-/** Stosuje profil do liniowego obrazu {b, g, r} (w miejscu zwraca nowe kanały). */
-export function correctLens(img, profile, width, height) {
-  const w = width, h = height, n = w * h;
-  const cx = (w - 1) / 2, cy = (h - 1) / 2, R = Math.hypot(cx, cy);
+// (Python liczy współrzędne w float32 — Math.fround odtwarza to dla zgodności z OpenCV)
+const f32 = Math.fround;
+const radius = (x, y, cx, cy, R) => {
+  const dx = f32(x - cx), dy = f32(y - cy);
+  return f32(f32(Math.sqrt(f32(f32(dx * dx) + f32(dy * dy)))) / R);
+};
 
-  // winieta: współczynnik spadku światła -> dzielimy, rogi się rozjaśniają
-  // (Python liczy współrzędne w float32 — Math.fround odtwarza to dla zgodności z OpenCV)
-  const f32 = Math.fround;
-  const radius = (x, y) => {
-    const dx = f32(x - cx), dy = f32(y - cy);
-    return f32(f32(Math.sqrt(f32(f32(dx * dx) + f32(dy * dy)))) / R);
-  };
-  const falloff = Float32Array.from(profile.vignetting, (v) => 2 ** (0.5 - 2 ** (v * 2 ** -13 - 1)));
-  for (let y = 0; y < h; y++) {
+/** Winieta: dzieli przez współczynnik spadku światła (rogi się rozjaśniają), w miejscu. */
+export function sonyVignetteRows({ b, g, r, w, falloff, cx, cy, R }, y0, y1) {
+  for (let y = y0; y < y1; y++) {
     for (let x = 0; x < w; x++) {
       const i = y * w + x;
-      const f = f32(interpKnots(falloff, radius(x, y)));
-      img.b[i] /= f; img.g[i] /= f; img.r[i] /= f;
+      const f = f32(interpKnots(falloff, radius(x, y, cx, cy, R)));
+      b[i] /= f; g[i] /= f; r[i] /= f;
     }
   }
+}
 
-  // dystorsja (+ aberracja chromatyczna dla R i B)
+/** Dystorsja (+ aberracja chromatyczna dla R i B): promień liczony raz dla trzech kanałów. */
+export function sonyRemapRows({ src, dst, w, h, cx, cy, R, scales }, y0, y1) {
+  const chans = ["b", "g", "r"].map((c) => [src[c], dst[c], scales[c]]);
+  for (let y = y0; y < y1; y++) {
+    const dy = f32(y - cy);
+    for (let x = 0; x < w; x++) {
+      const dx = f32(x - cx);
+      const rad = radius(x, y, cx, cy, R);
+      for (const [s, d, sc] of chans) {
+        const k = f32(interpKnots(sc, rad));
+        const acc = sampleCubic(s, w, h, f32(cx + f32(dx * k)), f32(cy + f32(dy * k)));
+        d[y * w + x] = acc > 0 ? acc : 0;
+      }
+    }
+  }
+}
+
+/** Stosuje profil do liniowego obrazu {b, g, r}; zwraca obraz z nowymi kanałami. */
+export async function correctLens(exec, img, profile) {
+  const { width: w, height: h } = img;
+  const cx = (w - 1) / 2, cy = (h - 1) / 2, R = Math.hypot(cx, cy);
+  const falloff = Float32Array.from(profile.vignetting, (v) => 2 ** (0.5 - 2 ** (v * 2 ** -13 - 1)));
+  await exec.rows("sonyVignette", { b: img.b, g: img.g, r: img.r, w, falloff, cx, cy, R }, h, w);
+
   let base = Float32Array.from(profile.distortion, (d) => d * 2 ** -14 + 1);
   const fs = fillScale(base, cx, cy);
   base = base.map((v) => v * fs);
@@ -150,21 +170,8 @@ export function correctLens(img, profile, width, height) {
     g: base,
     b: base.map((v, i) => v * (caB[i] * 2 ** -21 + 1)),
   };
-
-  const out = {};
-  for (const c of ["b", "g", "r"]) {
-    const src = img[c], dst = new Float32Array(n), sc = scales[c];
-    for (let y = 0; y < h; y++) {
-      const dy = f32(y - cy);
-      for (let x = 0; x < w; x++) {
-        const dx = f32(x - cx);
-        const s = f32(interpKnots(sc, radius(x, y)));
-        const acc = sampleCubic(src, w, h, f32(cx + f32(dx * s)), f32(cy + f32(dy * s)));
-        dst[y * w + x] = acc > 0 ? acc : 0;
-      }
-    }
-    out[c] = dst;
-    img[c] = null;
-  }
-  return { ...img, ...out };
+  const n = w * h;
+  const dst = { b: exec.f32(n), g: exec.f32(n), r: exec.f32(n) };
+  await exec.rows("sonyRemap", { src: { b: img.b, g: img.g, r: img.r }, dst, w, h, cx, cy, R, scales }, h, w);
+  return { ...img, ...dst };
 }

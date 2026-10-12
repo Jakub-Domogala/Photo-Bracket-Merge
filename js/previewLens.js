@@ -8,7 +8,7 @@
 // Model: raw = c + (d / R) * (q0 + q1 r² + q2 r⁴ ...), gdzie d = punkt podglądu - środek
 // podglądu, R = pół przekątnej podglądu, r = |d| / R.
 
-import { percentile } from "./pipeline.js";
+import { percentiles, minMaxRows, histRows } from "./pipeline.js";
 import { sampleCubic } from "./lens.js";
 
 const PREVIEW_MIN_SCALE = 0.75;   // podgląd musi mieć co najmniej tyle szerokości RAW-a
@@ -26,12 +26,15 @@ const VIG_MIN_V = 0.08, VIG_MAX_V = 0.92;  // zakres jasności podglądu (bez cz
 const VIG_MAX_GAIN = 4.0;
 
 const f32 = Math.fround;
+// percentyl w bieżącym wątku (rawGray i tak działa już w workerze dekodującym)
+const ROWS = { minMax: minMaxRows, hist: histRows };
+const inline = { size: 1, rows: async (name, args, h) => [ROWS[name](args, 0, h)] };
 
 // --- przygotowanie obrazów ---
 
 /** Podgląd RGBA (uint8) -> szarość (b+g+r)/3/255, obrócona jak wynik LibRaw. */
-export function previewGray({ data, width, height }, flip, rawWidth, rawHeight) {
-  let g = new Float32Array(width * height);
+export function previewGray({ data, width, height }, flip, rawWidth, rawHeight, alloc = (n) => new Float32Array(n)) {
+  let g = alloc(width * height);
   for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = f32(f32((data[j + 2] + data[j + 1] + data[j]) / 3) / 255);
   let w = width, h = height;
   // kody LibRaw: 3 = 180°, 5 = 90° w lewo, 6 = 90° w prawo. Przeglądarka mogła już obrócić
@@ -40,7 +43,7 @@ export function previewGray({ data, width, height }, flip, rawWidth, rawHeight) 
   if (flip === 3) {
     g.reverse();
   } else if ((flip === 5 || flip === 6) && turned) {
-    const out = new Float32Array(g.length);
+    const out = alloc(g.length);
     for (let i = 0; i < w; i++) {
       for (let j = 0; j < h; j++) {
         // np.rot90(k=1): out[i, j] = in[j, W-1-i];  np.rot90(k=-1): out[i, j] = in[H-1-j, i]
@@ -54,15 +57,15 @@ export function previewGray({ data, width, height }, flip, rawWidth, rawHeight) 
 }
 
 /** Liniowa szarość (b+g+r)/3 jak img.mean(-1) w numpy (float32). */
-function linearGray({ b, g, r }) {
-  const out = new Float32Array(b.length);
+function linearGray({ b, g, r }, alloc) {
+  const out = alloc(b.length);
   for (let i = 0; i < out.length; i++) out[i] = f32(f32(f32(b[i] + g[i]) + r[i]) / 3);
   return out;
 }
 
-function toSrgbGray(lin) {
-  const scale = Math.max(percentile(lin, 99), 1e-6);
-  const out = new Float32Array(lin.length);
+async function toSrgbGray(lin, width, height, alloc) {
+  const scale = Math.max((await percentiles(inline, lin, [99], width, height))[0], 1e-6);
+  const out = alloc(lin.length);
   for (let i = 0; i < out.length; i++) {
     let x = lin[i] / scale;
     x = x < 0 ? 0 : x > 1 ? 1 : x;
@@ -185,36 +188,35 @@ function matchPatch(pd, px0, py0, rd, wx0, wy0, P, S, scores) {
   return { best, bx, by };
 }
 
-function matchPoints(pairs, sol, cp, R, f, P, S, minNcc) {
+/** Dopasowania łat podglądu do RAW-a jednej klatki (jądro, klatki liczą się równolegle). */
+export function matchPair({ pair: { raw, prev }, sol, cp, R, f, P, S, minNcc }) {
   const o = (f - 1) / 2, span = 2 * S + 1;
   const scores = new Float64Array(span * span);
   const pos = [0, 0];
   const pts = [];
-  for (const { raw, prev } of pairs) {
-    const rd = boxDown(raw.gray, raw.width, raw.height, f);
-    const pd = boxDown(prev.gray, prev.width, prev.height, f);
-    for (let y = P; y < pd.h - P; y += 2 * P) {
-      for (let x = P; x < pd.w - P; x += 2 * P) {
-        // odchylenie std łaty (jak patch.std() w numpy)
-        let m = 0, m2 = 0;
-        const side = 2 * P + 1;
-        for (let yy = y - P; yy <= y + P; yy++) {
-          for (let xx = x - P; xx <= x + P; xx++) { const val = pd.data[yy * pd.w + xx]; m += val; m2 += val * val; }
-        }
-        m /= side * side;
-        if (Math.sqrt(Math.max(m2 / (side * side) - m * m, 0)) < MIN_TEXTURE) continue;
-
-        const px = x * f + o, py = y * f + o;
-        lensMap(sol, px, py, cp, R, pos);
-        const ix = Math.floor((pos[0] - o) / f + 0.5), iy = Math.floor((pos[1] - o) / f + 0.5);
-        if (ix - P - S < 0 || iy - P - S < 0 || ix + P + S >= rd.w || iy + P + S >= rd.h) continue;
-        const { best, bx, by } = matchPatch(pd, x - P, y - P, rd, ix - P - S, iy - P - S, P, S, scores);
-        if (best < minNcc || bx === 0 || bx === 2 * S || by === 0 || by === 2 * S) continue;
-        const at = (u, v) => scores[v * span + u];
-        const sx = parabolaPeak(at(bx - 1, by), at(bx, by), at(bx + 1, by));
-        const sy = parabolaPeak(at(bx, by - 1), at(bx, by), at(bx, by + 1));
-        pts.push([px, py, (ix - S + bx + sx) * f + o, (iy - S + by + sy) * f + o]);
+  const rd = boxDown(raw.gray, raw.width, raw.height, f);
+  const pd = boxDown(prev.gray, prev.width, prev.height, f);
+  for (let y = P; y < pd.h - P; y += 2 * P) {
+    for (let x = P; x < pd.w - P; x += 2 * P) {
+      // odchylenie std łaty (jak patch.std() w numpy)
+      let m = 0, m2 = 0;
+      const side = 2 * P + 1;
+      for (let yy = y - P; yy <= y + P; yy++) {
+        for (let xx = x - P; xx <= x + P; xx++) { const val = pd.data[yy * pd.w + xx]; m += val; m2 += val * val; }
       }
+      m /= side * side;
+      if (Math.sqrt(Math.max(m2 / (side * side) - m * m, 0)) < MIN_TEXTURE) continue;
+
+      const px = x * f + o, py = y * f + o;
+      lensMap(sol, px, py, cp, R, pos);
+      const ix = Math.floor((pos[0] - o) / f + 0.5), iy = Math.floor((pos[1] - o) / f + 0.5);
+      if (ix - P - S < 0 || iy - P - S < 0 || ix + P + S >= rd.w || iy + P + S >= rd.h) continue;
+      const { best, bx, by } = matchPatch(pd, x - P, y - P, rd, ix - P - S, iy - P - S, P, S, scores);
+      if (best < minNcc || bx === 0 || bx === 2 * S || by === 0 || by === 2 * S) continue;
+      const at = (u, v) => scores[v * span + u];
+      const sx = parabolaPeak(at(bx - 1, by), at(bx, by), at(bx + 1, by));
+      const sy = parabolaPeak(at(bx, by - 1), at(bx, by), at(bx, by + 1));
+      pts.push([px, py, (ix - S + bx + sx) * f + o, (iy - S + by + sy) * f + o]);
     }
   }
   return pts;
@@ -261,58 +263,66 @@ function bilinear(img, x, y) {
 
 /** Spadek światła na brzegach, który aparat skorygował w podglądzie. Dla pikseli o tej samej
  * jasności w podglądzie porównujemy RAW w kolejnych pierścieniach ze środkiem kadru — krzywa
- * tonalna aparatu się wtedy skraca. Zwraca [b1, b2]: log(spadek) = b1 r² + b2 r⁴. */
-function fitVignetting(pairs, sol, cp, R) {
+ * tonalna aparatu się wtedy skraca. fitVignetting zwraca [b1, b2]: log(spadek) = b1 r² + b2 r⁴. */
+export function vignetteSamples({ pair: { lin, prev }, sol, cp, R }) {
   const f = VIG_FACTOR, o = (f - 1) / 2;
   const samples = []; // [pierścień, średni promień, log(spadek), waga]
   const pos = [0, 0];
-  for (const { lin, prev } of pairs) {
-    const pd = boxDown(prev.gray, prev.width, prev.height, f);
-    const rd = boxDown(lin, prev.rawWidth, prev.rawHeight, f);
-    const n = pd.w * pd.h;
-    const g = new Float64Array(n), r = new Float64Array(n), ring = new Int32Array(n), level = new Int32Array(n);
-    const valid = new Uint8Array(n);
-    for (let y = 0, i = 0; y < pd.h; y++) {
-      for (let x = 0; x < pd.w; x++, i++) {
-        const px = x * f + o, py = y * f + o;
-        lensMap(sol, px, py, cp, R, pos);
-        g[i] = bilinear(rd, (pos[0] - o) / f, (pos[1] - o) / f);
-        r[i] = Math.hypot(px - cp[0], py - cp[1]) / R;
-        ring[i] = Math.min(Math.trunc(r[i] * VIG_RINGS), VIG_RINGS - 1);
-        const v = pd.data[i];
-        valid[i] = v >= VIG_MIN_V && v < VIG_MAX_V && g[i] > 0;
-        level[i] = Math.trunc((v - VIG_MIN_V) / (VIG_MAX_V - VIG_MIN_V) * VIG_LEVELS);
-      }
+  const pd = boxDown(prev.gray, prev.width, prev.height, f);
+  const rd = boxDown(lin, prev.rawWidth, prev.rawHeight, f);
+  const n = pd.w * pd.h;
+  const g = new Float64Array(n), r = new Float64Array(n), ring = new Int32Array(n), level = new Int32Array(n);
+  const valid = new Uint8Array(n);
+  for (let y = 0, i = 0; y < pd.h; y++) {
+    for (let x = 0; x < pd.w; x++, i++) {
+      const px = x * f + o, py = y * f + o;
+      lensMap(sol, px, py, cp, R, pos);
+      g[i] = bilinear(rd, (pos[0] - o) / f, (pos[1] - o) / f);
+      r[i] = Math.hypot(px - cp[0], py - cp[1]) / R;
+      ring[i] = Math.min(Math.trunc(r[i] * VIG_RINGS), VIG_RINGS - 1);
+      const v = pd.data[i];
+      valid[i] = v >= VIG_MIN_V && v < VIG_MAX_V && g[i] > 0;
+      level[i] = Math.trunc((v - VIG_MIN_V) / (VIG_MAX_V - VIG_MIN_V) * VIG_LEVELS);
     }
-    for (let lv = 0; lv < VIG_LEVELS; lv++) {
-      const cells = Array.from({ length: VIG_RINGS }, () => ({ g: [], r: [] }));
-      for (let i = 0; i < n; i++) {
-        if (valid[i] && level[i] === lv) { cells[ring[i]].g.push(g[i]); cells[ring[i]].r.push(r[i]); }
-      }
-      const center = [...cells[0].g, ...cells[1].g, ...cells[2].g];
-      if (center.length < 50) continue;
-      const ref = median(center);
-      for (let rb = 3; rb < VIG_RINGS; rb++) {
-        const c = cells[rb];
-        if (c.g.length >= 30) {
-          samples.push([rb, c.r.reduce((s, v) => s + v, 0) / c.r.length, Math.log(median(c.g) / ref), c.g.length]);
-        }
+  }
+  for (let lv = 0; lv < VIG_LEVELS; lv++) {
+    const cells = Array.from({ length: VIG_RINGS }, () => ({ g: [], r: [] }));
+    for (let i = 0; i < n; i++) {
+      if (valid[i] && level[i] === lv) { cells[ring[i]].g.push(g[i]); cells[ring[i]].r.push(r[i]); }
+    }
+    const center = [...cells[0].g, ...cells[1].g, ...cells[2].g];
+    if (center.length < 50) continue;
+    const ref = median(center);
+    for (let rb = 3; rb < VIG_RINGS; rb++) {
+      const c = cells[rb];
+      if (c.g.length >= 30) {
+        samples.push([rb, c.r.reduce((s, v) => s + v, 0) / c.r.length, Math.log(median(c.g) / ref), c.g.length]);
       }
     }
   }
+  return samples;
+}
+
+function fitVignetting(samples) {
   if (new Set(samples.filter((s) => s[0] >= 5).map((s) => s[0])).size < 3) return [0, 0];
   return leastSquares(samples.map((s) => [s[1] ** 2, s[1] ** 4]), samples.map((s) => s[2]), samples.map((s) => s[3]));
 }
 
 // --- całość ---
 
+/** Szarość RAW-a do porównań z podglądem: liniowa i w sRGB (jądro, liczone przy dekodowaniu). */
+export async function rawGray(img, alloc = (n) => new Float32Array(n)) {
+  const lin = linearGray(img, alloc);
+  return { lin, srgb: await toSrgbGray(lin, img.width, img.height, alloc) };
+}
+
 /**
  * Mierzy korekcję aparatu z podglądów całego bracketu.
- * @param frames   liniowe klatki {b, g, r, width, height}
+ * @param frames   liniowe klatki {b, g, r, width, height, gray: wynik rawGray()}
  * @param previews wyniki previewGray() albo null (brak podglądu)
  * @returns opis korekcji albo null
  */
-export function fitPreviewCorrection(frames, previews, progress = () => {}) {
+export async function fitPreviewCorrection(exec, frames, previews, progress = () => {}) {
   const wr = frames[0].width, hr = frames[0].height;
   if (previews.some((p) => !p) || previews.some((p) => p.width !== previews[0].width || p.height !== previews[0].height)) return null;
   const wp = previews[0].width, hp = previews[0].height;
@@ -320,42 +330,35 @@ export function fitPreviewCorrection(frames, previews, progress = () => {}) {
   const cp = [(wp - 1) / 2, (hp - 1) / 2];
   const R = Math.hypot(cp[0], cp[1]);
 
-  const pairs = frames.map((img, k) => {
-    const lin = linearGray(img);
-    return {
-      lin,
-      raw: { gray: toSrgbGray(lin), width: wr, height: hr },
-      prev: { ...previews[k], rawWidth: wr, rawHeight: hr },
-    };
-  });
+  const pairs = frames.map((img, k) => ({
+    lin: img.gray.lin,
+    raw: { gray: img.gray.srgb, width: wr, height: hr },
+    prev: { ...previews[k], rawWidth: wr, rawHeight: hr },
+  }));
 
   let sol = [(wr - 1) / 2, (hr - 1) / 2, (wr / wp) * R];
   let error = null;
   for (const [k, [f, P, S, terms, minNcc]] of MATCH_LEVELS.entries()) {
     progress(`Pomiar korekcji obiektywu z podglądu (${k + 1}/${MATCH_LEVELS.length})`);
-    const pts = matchPoints(pairs, sol, cp, R, f, P, S, minNcc);
+    const pts = (await exec.each("matchPair", pairs.map((pair) => ({ pair, sol, cp, R, f, P, S, minNcc })))).flat();
     if (pts.length < MIN_MATCHES) return null;
     const fit = fitLensModel(pts, cp, R, terms, 0.25 * f);
     if (!fit) return null;
     ({ sol, error } = fit);
   }
   if (error > MAX_FIT_ERROR) return null;
-  const vig = fitVignetting(pairs, sol, cp, R);
+  const vig = fitVignetting((await exec.each("vignetteSamples", pairs.map((pair) => ({ pair, sol, cp, R })))).flat());
   let scale = sol[2] / R; // pikseli RAW na piksel podglądu w środku kadru
   if (Math.abs(scale - 1) < 0.03) scale = 1;
   return { sol, cp, R, scale, vig, width: Math.round(wp * scale), height: Math.round(hp * scale), error };
 }
 
-/** Przekształca liniowy obraz do kadru aparatu i wyrównuje winietę. Zwraca nowy obraz. */
-export function applyPreviewCorrection(img, geo) {
-  const { width: w, height: h, cp, R, scale, sol } = geo;
-  const [b1, b2] = geo.vig;
-  const n = w * h;
-  const mapX = new Float32Array(n), mapY = new Float32Array(n), gain = new Float32Array(n);
+/** Mapa przekształcenia (pozycje w RAW-ie) i wzmocnienie winiety dla wierszy wyniku. */
+export function previewMapRows({ mapX, mapY, gain, w, h, cp, R, scale, sol, vig: [b1, b2] }, y0, y1) {
   const pos = [0, 0];
-  for (let y = 0, i = 0; y < h; y++) {
+  for (let y = y0; y < y1; y++) {
     const py = cp[1] + (y - (h - 1) / 2) / scale;
-    for (let x = 0; x < w; x++, i++) {
+    for (let x = 0, i = y * w; x < w; x++, i++) {
       const px = cp[0] + (x - (w - 1) / 2) / scale;
       lensMap(sol, px, py, cp, R, pos);
       mapX[i] = pos[0];
@@ -364,15 +367,32 @@ export function applyPreviewCorrection(img, geo) {
       gain[i] = Math.min(Math.max(Math.exp(-(b1 * r2 + b2 * r2 * r2)), 1), VIG_MAX_GAIN);
     }
   }
-  const out = { width: w, height: h };
+}
+
+export function previewRemapRows({ src, dst, sw, sh, w, mapX, mapY, gain }, y0, y1) {
   for (const c of ["b", "g", "r"]) {
-    const src = img[c], dst = new Float32Array(n);
-    for (let i = 0; i < n; i++) {
-      const v = f32(f32(sampleCubic(src, img.width, img.height, mapX[i], mapY[i])) * gain[i]);
-      dst[i] = v > 0 ? v : 0;
+    const s = src[c], d = dst[c];
+    for (let i = y0 * w; i < y1 * w; i++) {
+      const v = f32(f32(sampleCubic(s, sw, sh, mapX[i], mapY[i])) * gain[i]);
+      d[i] = v > 0 ? v : 0;
     }
-    out[c] = dst;
-    img[c] = null;
   }
-  return out;
+}
+
+/** Mapa korekcji — wspólna dla wszystkich klatek bracketu. */
+export async function previewCorrectionMap(exec, geo) {
+  const { width: w, height: h } = geo;
+  const n = w * h;
+  const map = { mapX: exec.f32(n), mapY: exec.f32(n), gain: exec.f32(n), w };
+  await exec.rows("previewMap", { ...map, h, cp: geo.cp, R: geo.R, scale: geo.scale, sol: geo.sol, vig: geo.vig }, h, w);
+  return map;
+}
+
+/** Przekształca liniowy obraz do kadru aparatu i wyrównuje winietę. Zwraca nowy obraz. */
+export async function applyPreviewCorrection(exec, img, geo, map) {
+  const { width: w, height: h } = geo;
+  const n = w * h;
+  const dst = { b: exec.f32(n), g: exec.f32(n), r: exec.f32(n) };
+  await exec.rows("previewRemap", { src: { b: img.b, g: img.g, r: img.r }, dst, sw: img.width, sh: img.height, ...map }, h, w);
+  return { ...dst, width: w, height: h };
 }

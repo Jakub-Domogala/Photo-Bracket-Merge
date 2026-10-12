@@ -18,9 +18,11 @@ Anything LibRaw decodes: Sony `.ARW/.SRF/.SR2`, Canon `.CR2/.CR3/.CRW`, Nikon `.
 
 - `index.html`, `js/` — the web app (no build step, plain ES modules).
   - `js/pipeline.js` — the processing steps, a 1:1 port of the Python reference (Mertens mirrors OpenCV's implementation, including pyramid border handling).
+  - `js/exec.js`, `js/kernels.js`, `js/compute-worker.js` — parallel execution. Heavy loops are written as row kernels `(args, y0, y1)`; `PoolExec` splits the rows across a pool of workers (one per CPU core, images in `SharedArrayBuffer`), `InlineExec` runs the same kernels on one thread when shared memory isn't available. Both give the same output.
+  - `js/decode.js` — RAW decoding (each frame of a bracket in its own worker); `js/jpeg.js` — preview JPEG decoding.
   - `js/lens.js` — reads the Sony lens profile (ARW tags `0x7032/0x7035/0x7037`) and applies it.
   - `js/previewLens.js` — lens correction measured from the embedded JPEG preview (non-Sony cameras).
-  - `js/worker.js` — runs everything in a Web Worker; `js/app.js` — UI; `js/zip.js` — ZIP for several brackets.
+  - `js/worker.js` — runs everything off the UI thread and owns the worker pool; `js/app.js` — UI; `js/zip.js` — ZIP for several brackets.
 - `js/formats.js` — accepted RAW extensions.
 - `vendor/libraw-wasm/` — [LibRaw-Wasm](https://github.com/ybouane/LibRaw-Wasm) 1.6.0 (LibRaw compiled to WebAssembly) for RAW decoding.
 - `coi-serviceworker.js` — [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) 0.1.7. LibRaw-Wasm needs `SharedArrayBuffer`, which requires COOP/COEP headers that GitHub Pages can't set; this service worker adds them.
@@ -39,7 +41,7 @@ python3 -m http.server 8000    # http://127.0.0.1:8000
 
 ```sh
 python3.10 -m venv .venv && .venv/bin/pip install -r requirements.txt
-node --max-old-space-size=8192 tests/run_js.mjs <folder_with_raw> /tmp/out [--lens-correction] [--auto-wb]
+node --max-old-space-size=8192 tests/run_js.mjs <folder_with_raw> /tmp/out [--lens-correction] [--auto-wb] [--threads N] [--timing]
 .venv/bin/python tests/compare.py <folder_with_raw> /tmp/out [--lens-correction] [--auto-wb]
 ```
 
@@ -49,4 +51,12 @@ On 14 test brackets the outputs match: mean difference ≤ 0.001/255 (0.03/255 w
 
 - libraw-wasm ignores the `gamm` setting and always outputs LibRaw's BT.709 curve; `js/pipeline.js` rebuilds LibRaw's exact `gamma_curve` and inverts it to get linear data.
 - The preview-based fit depends on the JPEG decoder: in Node (jpeg-js) results drift slightly from Python (≈1/255 mean, sub-pixel geometry); in Chrome (libjpeg-turbo, like OpenCV) they match to ≈0.4/255. With the same fitted parameters JS and Python agree to 0.001/255.
-- Full-resolution processing (24 MP × 3) needs ~2.5 GB RAM in the tab and ~10–15 s per bracket.
+- Full-resolution processing (24 MP × 3) needs ~3 GB RAM in the tab. Speed (Chrome, 16-core M-series Mac, one bracket of 3 frames):
+
+  | Bracket | single thread | worker pool |
+  |---|---|---|
+  | Sony 24 MP + lens profile | 22.9 s | 3.4 s |
+  | Canon G7 X 20 MP + preview lens correction | 18.0 s | 3.8 s |
+  | Sony 24 MP + auto WB | 14.3 s | 2.5 s |
+
+  Decoding (LibRaw, ~1.5–2 s) is now the largest part. With `navigator.deviceMemory` ≤ 4 GB frames are decoded one at a time to limit memory.

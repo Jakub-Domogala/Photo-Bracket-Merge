@@ -1,89 +1,79 @@
 // Cały bracket: dekodowanie -> (korekcja obiektywu) -> auto-ekspozycja -> Mertens
 // -> (auto WB) -> wykończenie. Odpowiednik merge() z reference/bracket_merge.py.
 
-import { linearize, autoExposure, mergeMertens, autoWhiteBalance, finish, KEY } from "./pipeline.js";
-import { readLensProfile, correctLens } from "./lens.js";
-import { previewGray, fitPreviewCorrection, applyPreviewCorrection } from "./previewLens.js";
-
-// Ustawienia jak rawpy.postprocess w wersji Python (gamma i tak jest odwracana w linearize)
-const DECODE_SETTINGS = { useCameraWb: true, noAutoBright: true, outputBps: 16, outputColor: 1 };
-
-/** Dekoduje plik RAW modułem LibRaw (libraw-wasm) do liniowego, planarnego BGR.
- * Z `withPreview` dołącza też podgląd JPEG z pliku ({ jpeg: Uint8Array, flip } albo null). */
-export function decodeRaw(LibRawModule, buffer, withPreview = false) {
-  const raw = new LibRawModule.LibRaw();
-  try {
-    raw.open(new Uint8Array(buffer), DECODE_SETTINGS);
-    const img = raw.imageData();
-    if (img.bits !== 16 || img.colors !== 3) throw new Error(`Nieoczekiwany format: ${img.bits} bit, ${img.colors} kanały`);
-    const out = linearize(img.data, img.width, img.height);
-    if (withPreview) {
-      let thumb = null;
-      try { thumb = raw.thumbnailData(); } catch { /* brak podglądu */ }
-      out.preview = thumb?.format === "jpeg" ? { jpeg: thumb.data, flip: raw.metadata().flip } : null;
-    }
-    return out;
-  } finally {
-    raw.delete?.();
-  }
-}
+import { autoExposure, mergeMertens, autoWhiteBalance, finish, KEY } from "./pipeline.js";
+import { correctLens } from "./lens.js";
+import { fitPreviewCorrection, previewCorrectionMap, applyPreviewCorrection, rawGray } from "./previewLens.js";
+import { InlineExec } from "./exec.js";
 
 /**
- * @param files     [{ name, buffer: ArrayBuffer }] — klatki jednego bracketu
- * @param opts      { lensCorrection, autoWb, key, decodeJpeg }
- *                  decodeJpeg(Uint8Array) -> Promise<{ data: RGBA, width, height }> — potrzebny
- *                  do korekcji obiektywu aparatów bez profilu Sony
+ * @param files     [{ name, buffer: ArrayBuffer }] — klatki jednego bracketu (bufory są przekazywane
+ *                  workerom dekodującym i potem nieużywalne)
+ * @param opts      { lensCorrection, autoWb, key,
+ *                    exec      — wykonawca obliczeń (js/exec.js), domyślnie w bieżącym wątku,
+ *                    decoders  — (n) => wykonawca do dekodowania n klatek naraz (zamykany po dekodowaniu),
+ *                    jpegDecoder — URL modułu z decodeJpeg() dla podglądów (domyślnie js/jpeg.js) }
  * @returns         { rgba: Uint8ClampedArray, width, height, warnings: string[] }
  */
-export async function mergeBracket(LibRawModule, files, opts = {}, progress = () => {}) {
+export async function mergeBracket(files, opts = {}, progress = () => {}) {
+  const exec = opts.exec ?? new InlineExec();
   const warnings = [];
-  let frames = [];
-  let width, height;
-  for (const [i, f] of files.entries()) {
-    progress(`Dekodowanie ${f.name} (${i + 1}/${files.length})`);
-    const img = decodeRaw(LibRawModule, f.buffer, opts.lensCorrection);
-    if (width === undefined) ({ width, height } = img);
-    else if (img.width !== width || img.height !== height) throw new Error(`${f.name}: inny rozmiar niż reszta bracketu`);
-    frames.push(img);
+
+  progress(files.length > 1 ? `Dekodowanie ${files.length} plików` : `Dekodowanie ${files[0].name}`);
+  const decoder = opts.decoders ? opts.decoders(files.length) : exec;
+  let frames;
+  try {
+    frames = await decoder.each("decode", files.map((f) => ({
+      buffer: f.buffer, name: f.name, lensCorrection: !!opts.lensCorrection,
+      jpegDecoder: opts.jpegDecoder, shared: decoder !== exec || !(exec instanceof InlineExec),
+    })), files.map((f) => [f.buffer]));
+  } finally {
+    if (decoder !== exec) decoder.close();
+  }
+  let { width, height } = frames[0];
+  for (const [i, img] of frames.entries()) {
+    if (img.width !== width || img.height !== height) throw new Error(`${files[i].name}: inny rozmiar niż reszta bracketu`);
   }
 
   if (opts.lensCorrection) {
     // profil Sony z ARW, a gdy go nie ma — korekcja zmierzona z podglądu JPEG w pliku RAW
-    const profiles = files.map((f) => readLensProfile(f.buffer));
-    if (profiles.every(Boolean)) {
-      frames = frames.map((img, i) => {
-        progress(`Korekcja obiektywu ${files[i].name}`);
-        return correctLens(img, profiles[i], width, height);
-      });
-    } else {
-      progress("Wczytywanie podglądów JPEG");
-      const previews = [];
-      for (const img of frames) {
-        previews.push(img.preview && opts.decodeJpeg
-          ? previewGray(await opts.decodeJpeg(img.preview.jpeg), img.preview.flip, width, height)
-          : null);
-        img.preview = null;
+    if (frames.every((img) => img.profile)) {
+      progress("Korekcja obiektywu");
+      for (let i = 0; i < frames.length; i++) {
+        const img = frames[i];
+        frames[i] = await correctLens(exec, img, img.profile);
+        exec.release(img.b, img.g, img.r);
       }
-      const geo = fitPreviewCorrection(frames, previews, progress);
+    } else {
+      for (const img of frames) img.gray ??= await rawGray(img, (n) => exec.f32(n));
+      const geo = await fitPreviewCorrection(exec, frames, frames.map((img) => img.preview), progress);
+      for (const img of frames) {
+        exec.release(img.gray.lin, img.gray.srgb, img.preview?.gray);
+        img.gray = img.preview = null;
+      }
       if (!geo) {
         warnings.push(`${files[0].name}…: brak profilu obiektywu i nie udało się zmierzyć korekcji z podglądu, pominięto korekcję.`);
       } else {
-        frames = frames.map((img, i) => {
-          progress(`Korekcja obiektywu ${files[i].name}`);
-          return applyPreviewCorrection(img, geo);
-        });
+        progress("Korekcja obiektywu");
+        const map = await previewCorrectionMap(exec, geo);
+        for (let i = 0; i < frames.length; i++) {
+          const img = frames[i];
+          frames[i] = await applyPreviewCorrection(exec, img, geo, map);
+          exec.release(img.b, img.g, img.r);
+        }
+        exec.release(map.mapX, map.mapY, map.gain);
         ({ width, height } = geo);
       }
     }
   }
 
   progress("Auto-ekspozycja");
-  autoExposure(frames, opts.key ?? KEY);
-  let result = mergeMertens(frames, width, height, {}, progress);
+  await autoExposure(exec, frames, opts.key ?? KEY);
+  let result = await mergeMertens(exec, frames, width, height, {}, progress);
   if (opts.autoWb) {
     progress("Auto balans bieli");
-    result = autoWhiteBalance(result);
+    result = await autoWhiteBalance(exec, result, width, height);
   }
   progress("Wykończenie");
-  return { rgba: finish(result, width, height), width, height, warnings };
+  return { rgba: await finish(exec, result, width, height), width, height, warnings };
 }
