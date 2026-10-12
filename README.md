@@ -19,6 +19,7 @@ Anything LibRaw decodes: Sony `.ARW/.SRF/.SR2`, Canon `.CR2/.CR3/.CRW`, Nikon `.
 - `index.html`, `js/` — the web app (no build step, plain ES modules).
   - `js/pipeline.js` — the processing steps, a 1:1 port of the Python reference (Mertens mirrors OpenCV's implementation, including pyramid border handling).
   - `js/exec.js`, `js/kernels.js`, `js/compute-worker.js` — parallel execution. Heavy loops are written as row kernels `(args, y0, y1)`; `PoolExec` splits the rows across a pool of workers (one per CPU core, images in `SharedArrayBuffer`), `InlineExec` runs the same kernels on one thread when shared memory isn't available. Both give the same output.
+  - `js/gpu.js` — WebGPU version of lens correction, auto-exposure and Mertens fusion (used when available; on any GPU error the CPU path runs instead). Output differs from the CPU path only by float32 rounding (≤ 0.002/255 mean, ~0.0002 % of pixels off by more than 1 level). Add `?cpu` to the page URL to force the CPU path.
   - `js/decode.js` — RAW decoding (each frame of a bracket in its own worker); `js/jpeg.js` — preview JPEG decoding.
   - `js/lens.js` — reads the Sony lens profile (ARW tags `0x7032/0x7035/0x7037`) and applies it.
   - `js/previewLens.js` — lens correction measured from the embedded JPEG preview (non-Sony cameras).
@@ -51,12 +52,12 @@ On 14 test brackets the outputs match: mean difference ≤ 0.001/255 (0.03/255 w
 
 - libraw-wasm ignores the `gamm` setting and always outputs LibRaw's BT.709 curve; `js/pipeline.js` rebuilds LibRaw's exact `gamma_curve` and inverts it to get linear data.
 - The preview-based fit depends on the JPEG decoder: in Node (jpeg-js) results drift slightly from Python (≈1/255 mean, sub-pixel geometry); in Chrome (libjpeg-turbo, like OpenCV) they match to ≈0.4/255. With the same fitted parameters JS and Python agree to 0.001/255.
-- Full-resolution processing (24 MP × 3) needs ~3 GB RAM in the tab. Speed (Chrome, 16-core M-series Mac, one bracket of 3 frames):
+- Full-resolution processing (24 MP × 3) needs ~3 GB RAM in the tab. Speed for one 3-frame bracket (Chrome, 16-core Apple Silicon Mac, median of 3 runs):
 
-  | Bracket | single thread | worker pool |
-  |---|---|---|
-  | Sony 24 MP + lens profile | 22.9 s | 3.4 s |
-  | Canon G7 X 20 MP + preview lens correction | 18.0 s | 3.8 s |
-  | Sony 24 MP + auto WB | 14.3 s | 2.5 s |
+  | Bracket | before (1 thread) | CPU worker pool | + WebGPU |
+  |---|---|---|---|
+  | Sony 24 MP + lens profile | 23.3 s | 3.1 s | 1.8 s |
+  | Canon G7 X 20 MP + preview lens correction | 18.1 s | 3.7 s | 3.0 s |
+  | Sony 24 MP + auto WB | 14.2 s | 2.6 s | 2.3 s |
 
-  Decoding (LibRaw, ~1.5–2 s) is now the largest part. With `navigator.deviceMemory` ≤ 4 GB frames are decoded one at a time to limit memory.
+  What's left is mostly RAW decoding (LibRaw, ~1.3–1.8 s, frames in parallel) and, for non-Sony cameras, the preview fit (~0.6 s); the GPU part takes ~0.25 s. With `navigator.deviceMemory` ≤ 4 GB frames are decoded one at a time to limit memory.

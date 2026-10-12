@@ -75,7 +75,7 @@ function interpKnots(values, r) {
 }
 
 /** Największe powiększenie, przy którym brzeg wyniku nadal mieści się w surowym kadrze. */
-function fillScale(curve, cx, cy) {
+export function fillScale(curve, cx, cy) {
   const R = Math.hypot(cx, cy);
   let best = Infinity;
   for (let k = 0; k <= 2000; k++) {

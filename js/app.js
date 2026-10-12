@@ -72,6 +72,7 @@ mergeBtn.onclick = async () => {
         opts: {
           lensCorrection: document.getElementById("lens").checked,
           autoWb: document.getElementById("awb").checked,
+          gpu: !new URLSearchParams(location.search).has("cpu"), // ?cpu wyłącza WebGPU (porównania)
         },
       }, transfer);
     });
