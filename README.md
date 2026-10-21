@@ -2,7 +2,7 @@
 
 Merges bracketed RAW exposures (e.g. −2 / 0 / +2 EV, tripod) into one natural-looking image using Mertens exposure fusion. Built for interior / real-estate photos; no per-photo tuning.
 
-**Everything runs in the browser** — photos are never uploaded. Drop the RAW files, click **Połącz**, then **Pobierz**. One bracket gives a JPEG; several give a ZIP.
+**Everything runs in the browser** — photos are never uploaded. Drop the RAW files, click **Połącz**, then **Pobierz**. One bracket gives a JPEG; several give a ZIP. Tick **TIFF 16-bit** to also get an uncompressed 16-bit sRGB TIFF (~150 MB per 24 MP photo) for further editing: a second button **Pobierz TIFF 16-bit** appears next to the JPEG one (a separate ZIP when there are several brackets). Both files come from the same finished floating-point image, so the TIFF is the JPEG without the 8-bit rounding.
 
 Pipeline: RAW → linear RGB (camera WB) → optional lens correction (Sony: profile embedded in the ARW; other cameras: measured from the camera's JPEG preview inside the RAW) → alignment of frames moved between shots (whole-pixel shift from median threshold bitmaps, then an affine refinement for tilt, rotation, scale and sub-pixel shifts; crops at most 3 %, otherwise skipped) → common auto-exposure for the bracket → Mertens fusion → optional auto WB → tone finish (white stretch with soft highlight shoulder, black point, gentle S-curve, all on luminance so hues are preserved).
 
@@ -24,7 +24,7 @@ Anything LibRaw decodes: Sony `.ARW/.SRF/.SR2`, Canon `.CR2/.CR3/.CRW`, Nikon `.
   - `js/decode.js` — RAW decoding (each frame of a bracket in its own worker); `js/jpeg.js` — preview JPEG decoding.
   - `js/lens.js` — reads the Sony lens profile (ARW tags `0x7032/0x7035/0x7037`) and applies it.
   - `js/previewLens.js` — lens correction measured from the embedded JPEG preview (non-Sony cameras).
-  - `js/worker.js` — runs everything off the UI thread and owns the worker pool; `js/app.js` — UI; `js/zip.js` — ZIP for several brackets.
+  - `js/worker.js` — runs everything off the UI thread and owns the worker pool; `js/app.js` — UI; `js/zip.js` — ZIP for several brackets; `js/tiff.js` — minimal 16-bit RGB TIFF writer (little-endian, uncompressed, one strip).
 - `js/formats.js` — accepted RAW extensions.
 - `vendor/libraw-wasm/` — [LibRaw-Wasm](https://github.com/ybouane/LibRaw-Wasm) 1.6.0 (LibRaw compiled to WebAssembly) for RAW decoding.
 - `coi-serviceworker.js` — [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) 0.1.7. LibRaw-Wasm needs `SharedArrayBuffer`, which requires COOP/COEP headers that GitHub Pages can't set; this service worker adds them.
@@ -43,7 +43,7 @@ python3 -m http.server 8000    # http://127.0.0.1:8000
 
 ```sh
 python3.10 -m venv .venv && .venv/bin/pip install -r requirements.txt
-node --max-old-space-size=8192 tests/run_js.mjs <folder_with_raw> /tmp/out [--lens-correction] [--auto-wb] [--threads N] [--timing]
+node --max-old-space-size=8192 tests/run_js.mjs <folder_with_raw> /tmp/out [--lens-correction] [--auto-wb] [--threads N] [--timing] [--tiff]
 .venv/bin/python tests/compare.py <folder_with_raw> /tmp/out [--lens-correction] [--auto-wb]
 ```
 
@@ -53,6 +53,8 @@ Alignment check against the reference on a bracket whose frames are distorted by
 .venv/bin/python tests/dump_align.py <folder_with_raw> /tmp/align [seed]
 node tests/check_align.mjs /tmp/align      # plan and warped pixels must match cv2 (≤ 1e-6 / 1e-4)
 ```
+
+With `--tiff` the 16-bit TIFF is written too and `compare.py` checks it against the Python 16-bit result (mean difference ≈ 0.2/65535 on photo7).
 
 On 14 test brackets the outputs match: mean difference ≤ 0.001/255 (0.03/255 with auto WB), ≤ 0.003 % of pixels off by more than 2 levels.
 

@@ -1,10 +1,11 @@
 // Web Worker: dekodowanie i łączenie bracketów poza wątkiem UI. Ciężkie kroki rozdziela
 // między pulę workerów obliczeń (js/compute-worker.js), a gdy nie ma SharedArrayBuffer —
 // liczy wszystko tutaj.
-// Wejście:  { groups: [[{ name, buffer }]], opts: { lensCorrection, autoWb } }
-// Wyjście:  { type: "progress", text } | { type: "result", name, blob, warnings } | { type: "done" } | { type: "error", message }
+// Wejście:  { groups: [[{ name, buffer }]], opts: { lensCorrection, autoWb, tiff } }
+// Wyjście:  { type: "progress", text } | { type: "result", name, blob, tiffName, tiff, warnings } | { type: "done" } | { type: "error", message }
 
 import { mergeBracket } from "./merge.js";
+import { makeTiff } from "./tiff.js";
 import { PoolExec, InlineExec, browserWorker, canShare, COMPUTE_WORKER_URL } from "./exec.js";
 
 const JPEG_QUALITY = 0.95;
@@ -29,11 +30,12 @@ self.onmessage = async ({ data: { groups, opts } }) => {
       const progress = (text) => self.postMessage({ type: "progress", text: prefix + text });
       // setTimeout pozwala wiadomościom o postępie wyjść przed kolejnym długim krokiem
       await new Promise((r) => setTimeout(r));
-      const { rgba, width, height, warnings } = await mergeBracket(group, { ...opts, exec, decoders }, progress);
+      const { rgba, rgb16, width, height, warnings } = await mergeBracket(group, { ...opts, exec, decoders }, progress);
       progress("Zapisywanie JPEG");
       const blob = await encodeJpeg(rgba, width, height);
-      const name = `${group[0].name.replace(/\.[^.]+$/, "")}_${group.at(-1).name.replace(/\.[^.]+$/, "")}.jpg`;
-      self.postMessage({ type: "result", name, blob, warnings });
+      const stem = `${group[0].name.replace(/\.[^.]+$/, "")}_${group.at(-1).name.replace(/\.[^.]+$/, "")}`;
+      const tiff = rgb16 ? makeTiff(rgb16, width, height) : null;
+      self.postMessage({ type: "result", name: `${stem}.jpg`, blob, tiffName: `${stem}.tif`, tiff, warnings });
       groups[k] = null;
     }
     self.postMessage({ type: "done" });

@@ -40,6 +40,7 @@ export class InlineExec {
   #buf = new Buffers((Type, n) => new Type(n));
   f32(n) { return this.#buf.take(Float32Array, n); }
   u8(n) { return this.#buf.take(Uint8Array, n); }
+  u16(n) { return this.#buf.take(Uint16Array, n); }
   release(...arrays) { this.#buf.release(...arrays); }
   async rows(name, args, h) { return [kernels[name](args, 0, h)]; }
   async each(name, list) {
@@ -66,6 +67,7 @@ export class PoolExec {
   #buf = new Buffers((Type, n) => new Type(new SharedArrayBuffer(n * Type.BYTES_PER_ELEMENT)));
   f32(n) { return this.#buf.take(Float32Array, n); }
   u8(n) { return this.#buf.take(Uint8Array, n); }
+  u16(n) { return this.#buf.take(Uint16Array, n); }
   release(...arrays) { this.#buf.release(...arrays); }
 
   /** Jądro wierszowe na h wierszach szerokości w; zwraca wyniki pasów w kolejności wierszy. */

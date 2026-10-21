@@ -15,8 +15,9 @@ import { alignPlan, alignFrames, MAX_CROP } from "./align.js";
  *                    exec      — wykonawca obliczeń (js/exec.js), domyślnie w bieżącym wątku,
  *                    decoders  — (n) => wykonawca do dekodowania n klatek naraz (zamykany po dekodowaniu),
  *                    jpegDecoder — URL modułu z decodeJpeg() dla podglądów (domyślnie js/jpeg.js),
- *                    gpu       — true: korekcja, auto-ekspozycja i fuzja na WebGPU, jeśli jest }
- * @returns         { rgba: Uint8ClampedArray, width, height, warnings: string[], gpu: czy użyto GPU }
+ *                    gpu       — true: korekcja, auto-ekspozycja i fuzja na WebGPU, jeśli jest,
+ *                    tiff      — true: zwróć też rgb16 (16-bit, do js/tiff.js) }
+ * @returns         { rgba: Uint8ClampedArray, rgb16: Uint16Array | null, width, height, warnings: string[], gpu: czy użyto GPU }
  */
 export async function mergeBracket(files, opts = {}, progress = () => {}) {
   const exec = opts.exec ?? new InlineExec();
@@ -105,5 +106,6 @@ export async function mergeBracket(files, opts = {}, progress = () => {}) {
     result = await autoWhiteBalance(exec, result, width, height);
   }
   progress("Wykończenie");
-  return { rgba: await finish(exec, result, width, height), width, height, warnings, gpu: gpuUsed };
+  const { rgba, rgb16 } = await finish(exec, result, width, height, { sixteen: !!opts.tiff });
+  return { rgba, rgb16, width, height, warnings, gpu: gpuUsed };
 }

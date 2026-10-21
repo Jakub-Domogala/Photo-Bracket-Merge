@@ -34,10 +34,12 @@
     <label>Zdjęć w jednym bracketcie: <input id="group" type="number" min="1" value="3" style="width: 4em"></label>
     <label><input id="lens" type="checkbox" checked> Korekcja obiektywu (dystorsja i winieta jak w JPEG-u z aparatu)</label>
     <label><input id="awb" type="checkbox"> Auto balans bieli</label>
+    <label><input id="tiff" type="checkbox"> Przygotuj też TIFF 16-bit do dalszej obróbki (ok. 150 MB na zdjęcie 24 Mpx)</label>
   </div>
 
   <button id="merge" disabled>Połącz</button>
   <a id="download" class="btn" hidden>Pobierz</a>
+  <a id="downloadTiff" class="btn" hidden>Pobierz TIFF 16-bit</a>
   <div id="status"></div>
 
   <script type="module" src="js/app.js"></script>

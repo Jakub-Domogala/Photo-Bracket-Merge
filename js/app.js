@@ -5,6 +5,7 @@ const drop = document.getElementById("drop");
 const picker = document.getElementById("picker");
 const mergeBtn = document.getElementById("merge");
 const download = document.getElementById("download");
+const downloadTiff = document.getElementById("downloadTiff");
 const status = document.getElementById("status");
 const DROP_HINT = drop.textContent;
 picker.accept = RAW_EXTENSIONS.flatMap((e) => [e, e.toUpperCase()]).join(",");
@@ -19,7 +20,7 @@ function setFiles(list) {
   files = [...list].filter((f) => isRaw(f.name)).sort((a, b) => a.name.localeCompare(b.name));
   drop.textContent = files.length ? `${files.length} plików RAW: ${files.map((f) => f.name).join(", ")}` : DROP_HINT;
   mergeBtn.disabled = !files.length;
-  download.hidden = true;
+  download.hidden = downloadTiff.hidden = true;
   setStatus("");
 }
 
@@ -40,7 +41,7 @@ mergeBtn.onclick = async () => {
     return;
   }
   mergeBtn.disabled = true;
-  download.hidden = true;
+  download.hidden = downloadTiff.hidden = true;
   setStatus("Wczytywanie plików…");
 
   const groups = [];
@@ -72,19 +73,26 @@ mergeBtn.onclick = async () => {
         opts: {
           lensCorrection: document.getElementById("lens").checked,
           autoWb: document.getElementById("awb").checked,
+          tiff: document.getElementById("tiff").checked,
           gpu: !new URLSearchParams(location.search).has("cpu"), // ?cpu wyłącza WebGPU (porównania)
         },
       }, transfer);
     });
 
-    const out = results.length === 1
-      ? { name: results[0].name, blob: results[0].blob }
-      : { name: "merged.zip", blob: await makeZip(results) };
-    if (download.href) URL.revokeObjectURL(download.href);
-    download.href = URL.createObjectURL(out.blob);
-    download.download = out.name;
-    download.hidden = false;
-    setStatus([`Gotowe: ${out.name}`, ...warnings].join("\n"));
+    // jeden bracket -> sam plik, kilka -> ZIP (osobny na JPEG-i i na TIFF-y)
+    const offer = async (link, files, zipName) => {
+      const out = files.length === 1 ? files[0] : { name: zipName, blob: await makeZip(files) };
+      if (link.href) URL.revokeObjectURL(link.href);
+      link.href = URL.createObjectURL(out.blob);
+      link.download = out.name;
+      link.hidden = false;
+      return out.name;
+    };
+    const names = [await offer(download, results.map((r) => ({ name: r.name, blob: r.blob })), "merged.zip")];
+    if (results.every((r) => r.tiff)) {
+      names.push(await offer(downloadTiff, results.map((r) => ({ name: r.tiffName, blob: r.tiff })), "merged_tiff.zip"));
+    }
+    setStatus([`Gotowe: ${names.join(", ")}`, ...warnings].join("\n"));
   } catch (err) {
     setStatus(`Błąd: ${err.message}`, true);
   } finally {

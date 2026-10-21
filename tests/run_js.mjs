@@ -2,6 +2,7 @@
 // Użycie: node tests/run_js.mjs <folder_z_raw> <wyjście_bez_rozszerzenia> [--lens-correction] [--auto-wb]
 //         [--threads N]  (0 = wszystko w jednym wątku; domyślnie liczba rdzeni, maks. 16)
 //         [--timing]     (czas każdego kroku)
+//         [--tiff]       (zapisz też 16-bit TIFF jako <wyjście>.tif)
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -9,6 +10,7 @@ import { Worker } from "worker_threads";
 import { mergeBracket } from "../js/merge.js";
 import { PoolExec, InlineExec, COMPUTE_WORKER_URL } from "../js/exec.js";
 import { isRaw } from "../js/formats.js";
+import { makeTiff } from "../js/tiff.js";
 
 const [dir, out, ...flags] = process.argv.slice(2);
 const flagValue = (name, def) => (flags.includes(name) ? Number(flags[flags.indexOf(name) + 1]) : def);
@@ -36,13 +38,14 @@ const progress = (text) => {
   if (flags.includes("--timing") && stage) console.log(`  ${stage}: ${((now - tStage) / 1000).toFixed(2)} s, rss ${(process.memoryUsage().rss / 1e9).toFixed(2)} GB`);
   stage = text; tStage = now;
 };
-const { rgba, width, height, warnings } = await mergeBracket(files, {
+const { rgba, rgb16, width, height, warnings } = await mergeBracket(files, {
   exec, decoders, jpegDecoder: new URL("./jpeg_node.mjs", import.meta.url).href,
-  lensCorrection: flags.includes("--lens-correction"), autoWb: flags.includes("--auto-wb"),
+  lensCorrection: flags.includes("--lens-correction"), autoWb: flags.includes("--auto-wb"), tiff: flags.includes("--tiff"),
 }, progress);
 progress(null);
 exec.close();
 warnings.forEach((w) => console.warn(w));
 fs.writeFileSync(out + ".rgba", rgba);
+if (rgb16) fs.writeFileSync(out + ".tif", Buffer.from(await makeTiff(rgb16, width, height).arrayBuffer()));
 fs.writeFileSync(out + ".json", JSON.stringify({ width, height }));
 console.log(`${path.basename(dir)}: ${width}x${height} in ${((performance.now() - t0) / 1000).toFixed(1)} s (${threads || 1} threads)`);

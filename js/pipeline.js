@@ -444,7 +444,7 @@ export function shoulderRows({ y, t, k, w }, y0, y1) {
   for (let i = y0 * w; i < y1 * w; i++) t[i] = shoulder(y[i] * k);
 }
 
-export function finishRows({ b, g, r, y, t, lo, rgba, w }, y0, y1) {
+export function finishRows({ b, g, r, y, t, lo, rgba, rgb16, w }, y0, y1) {
   for (let i = y0 * w; i < y1 * w; i++) {
     let v = clip01((t[i] - lo) / (1 - lo));
     v = (1 - S_CURVE) * v + S_CURVE * (v * v * (3 - 2 * v));
@@ -461,11 +461,26 @@ export function finishRows({ b, g, r, y, t, lo, rgba, w }, y0, y1) {
     rgba[j + 1] = Math.round(clip01(og) * 255);
     rgba[j + 2] = Math.round(clip01(ob) * 255);
     rgba[j + 3] = 255;
+    if (rgb16) {
+      const k = i * 3;
+      rgb16[k] = Math.round(clip01(or) * 65535);
+      rgb16[k + 1] = Math.round(clip01(og) * 65535);
+      rgb16[k + 2] = Math.round(clip01(ob) * 65535);
+    }
   }
 }
 
-/** Zwraca RGBA 8-bit (gotowe do canvas / JPEG, zwykły bufor). */
-export async function finish(exec, srgb, w, h) {
+/** Kopia na zwykłej pamięci (Blob i ImageData nie przyjmują pamięci współdzielonej). */
+function plain(exec, arr, Type) {
+  if (arr.buffer instanceof ArrayBuffer) return new Type(arr.buffer);
+  const copy = new Type(arr);
+  exec.release(arr);
+  return copy;
+}
+
+/** Zwraca { rgba, rgb16 }: RGBA 8-bit (gotowe do canvas / JPEG, zwykły bufor) i, z `sixteen`, RGB 16-bit
+ * (przeplot R, G, B) do TIFF-a, zaokrąglone z tych samych liczb zmiennoprzecinkowych; inaczej rgb16 = null. */
+export async function finish(exec, srgb, w, h, { sixteen = false } = {}) {
   const { b, g, r } = srgb;
   const n = w * h;
   const y = exec.f32(n);
@@ -476,10 +491,11 @@ export async function finish(exec, srgb, w, h) {
   await exec.rows("shoulder", { y, t, k, w }, h, w);
   const [lo] = await percentiles(exec, t, [BLACK_PCT], w, h);
   const rgba = exec.u8(n * 4);
-  await exec.rows("finish", { b, g, r, y, t, lo, rgba, w }, h, w);
+  const rgb16 = sixteen ? exec.u16(n * 3) : null;
+  await exec.rows("finish", { b, g, r, y, t, lo, rgba, rgb16, w }, h, w);
   exec.release(y, t, b, g, r);
-  if (rgba.buffer instanceof ArrayBuffer) return new Uint8ClampedArray(rgba.buffer);
-  const copy = new Uint8ClampedArray(rgba); // ImageData nie przyjmuje pamięci współdzielonej
-  exec.release(rgba);
-  return copy;
+  return {
+    rgba: new Uint8ClampedArray(plain(exec, rgba, Uint8Array).buffer),
+    rgb16: sixteen ? plain(exec, rgb16, Uint16Array) : null,
+  };
 }
