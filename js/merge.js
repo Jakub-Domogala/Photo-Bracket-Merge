@@ -58,6 +58,7 @@ export async function mergeBracket(files, opts = {}, progress = () => {}) {
   if (lens?.geo) ({ width, height } = lens.geo);
   const key = opts.key ?? KEY;
   const alignWarning = (plan) => {
+    if (plan?.implausible?.length) warnings.push(`${files[0].name}…: klatka ${plan.implausible.map((k) => k + 1).join(", ")} jest obrócona lub przeskalowana ponad normę, zostaje samo przesunięcie.`);
     if (plan?.tooBig) warnings.push(`${files[0].name}…: klatki są przesunięte za bardzo (przycięcie > ${MAX_CROP * 100} %), pominięto wyrównanie.`);
   };
 

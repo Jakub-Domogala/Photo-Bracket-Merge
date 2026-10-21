@@ -405,16 +405,199 @@ def find_shift(ref_pyr: list, pyr: list) -> tuple:
     return sx, sy
 
 
+# Dopasowanie afiniczne (przesunięcie + obrót + skala + ścinanie) jako poprawka po wyrównaniu
+# o całe piksele. Algorytm jest celowo prosty (Gauss-Newton na znormalizowanych obrazach), żeby
+# js/align.js dał ten sam wynik: klatki o różnej ekspozycji porównujemy po gradiencie log-jasności
+# (stała różnica ekspozycji znika), bez pikseli prawie czarnych i przepalonych.
+AFFINE_WORK_W = 2000        # szarości zmniejszamy tak długo, aż szerokość <= tyle (potem 3 poziomy piramidy)
+AFFINE_LEVELS = 3
+AFFINE_ITERS = (20, 12, 8)  # iteracje od najmniejszego poziomu
+AFFINE_LO = float(np.log(0.004))  # log-jasność poniżej / powyżej: piksel prawie czarny / przepalony
+AFFINE_HI = float(np.log(0.9))
+AFFINE_MAX_ROT = 3.0        # stopnie
+AFFINE_MAX_SCALE = 0.05     # |skala - 1|
+AFFINE_MAX_MOVE = 0.06      # poprawka afiniczna nie może przesunąć rogu o więcej niż tyle dłuższego boku
+AFFINE_MIN_CC = 0.5         # słabsze dopasowanie traktujemy jako nieudane (zostaje samo przesunięcie)
+AFFINE_SKIP_PX = 0.5        # poprawka mniejsza niż tyle pikseli (pełna rozdzielczość) nie jest warta resamplingu
+AFFINE_MAX_STEP = 0.02      # największa zmiana parametru w jednej iteracji
+AFFINE_MARGIN = 2           # klatki warpowane tracą na brzegu tyle pikseli (odbicie brzegu psuje obraz)
+
+
+def smooth121(a: np.ndarray) -> np.ndarray:
+    p = np.pad(a, ((0, 0), (1, 1)), mode="edge")
+    a = (p[:, :-2] + 2 * p[:, 1:-1] + p[:, 2:]) / 4
+    p = np.pad(a, ((1, 1), (0, 0)), mode="edge")
+    return (p[:-2] + 2 * p[1:-1] + p[2:]) / 4
+
+
+def central_gradient(a: np.ndarray):
+    gx, gy = np.zeros_like(a), np.zeros_like(a)
+    gx[:, 1:-1] = (a[:, 2:] - a[:, :-2]) / 2
+    gy[1:-1] = (a[2:] - a[:-2]) / 2
+    return gx, gy
+
+
+def valid_mask(g: np.ndarray) -> np.ndarray:
+    """Piksele o log-jasności w zakresie roboczym, z marginesem 3 px wokół reszty (tam gradient
+    pochodzi od brzegu przepalenia, nie od sceny)."""
+    ok = ((g > AFFINE_LO) & (g < AFFINE_HI)).astype(np.int32)
+    h, w = ok.shape
+    p = np.pad(ok, 3)
+    s = sum(p[dy:dy + h, dx:dx + w] for dy in range(7) for dx in range(7))
+    return s == 49
+
+
+def affine_levels(gray: np.ndarray) -> list:
+    """Piramida cech (gradient log-jasności) + masek dla jednej klatki; gray = log-szarość pełnej
+    rozdzielczości (float32). Poziom 0 jest największy; 'lam' to jego skala względem pełnej."""
+    g, lam = gray, 1
+    while g.shape[1] > AFFINE_WORK_W:
+        g, lam = down2(g), lam * 2
+    out = []
+    for _ in range(AFFINE_LEVELS):
+        g64 = g.astype(np.float64)
+        gx, gy = central_gradient(smooth121(g64))
+        out.append({"f": smooth121(np.sqrt(gx * gx + gy * gy)), "m": valid_mask(g64), "lam": lam})
+        g, lam = down2(g), lam * 2
+    for lv in out:
+        lv["gx"], lv["gy"] = central_gradient(lv["f"])
+    return out
+
+
+def bilinear(a: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    x0, y0 = np.floor(x).astype(np.intp), np.floor(y).astype(np.intp)
+    fx, fy = x - x0, y - y0
+    top = a[y0, x0] * (1 - fx) + a[y0, x0 + 1] * fx
+    bot = a[y0 + 1, x0] * (1 - fx) + a[y0 + 1, x0 + 1] * fx
+    return top * (1 - fy) + bot * fy
+
+
+def affine_terms(A: dict, B: dict, p: np.ndarray, full_w: int, full_h: int):
+    """Składniki jednej iteracji na jednym poziomie. Model (współrzędne ciągłe, środek piksela
+    w +0.5): u = M (x - C) + C + s t, M = I + [[p0, p1], [p2, p3]], t = (p4, p5), C = środek
+    obrazu, s = połowa dłuższego boku — parametry są bezwymiarowe, więc ten sam wektor p opisuje
+    wszystkie poziomy. Zwraca (cc, liczba pikseli, macierz normalna H, wektor g) albo None."""
+    lam = A["lam"]
+    fa, ma = A["f"], A["m"]
+    h, w = fa.shape
+    cx, cy, s = full_w / 2 / lam, full_h / 2 / lam, max(full_w, full_h) / 2 / lam
+    ys, xs = np.mgrid[0:h, 0:w]
+    xc, yc = xs + 0.5 - cx, ys + 0.5 - cy
+    ux = (1 + p[0]) * xc + p[1] * yc + cx + s * p[4] - 0.5
+    uy = p[2] * xc + (1 + p[3]) * yc + cy + s * p[5] - 0.5
+    ok = (ux >= 1) & (ux <= w - 3) & (uy >= 1) & (uy <= h - 3) & ma
+    ix = np.where(ok, np.floor(ux + 0.5), 0).astype(np.intp)
+    iy = np.where(ok, np.floor(uy + 0.5), 0).astype(np.intp)
+    ok &= B["m"][iy, ix]
+    n = int(ok.sum())
+    if n < 500:
+        return None
+    ux, uy = ux[ok], uy[ok]
+    a = fa[ok]
+    b = bilinear(B["f"], ux, uy)
+    gx, gy = bilinear(B["gx"], ux, uy), bilinear(B["gy"], ux, uy)
+    xc, yc = xc[ok], yc[ok]
+    sa, sb = a.std(), b.std()
+    if sa < 1e-9 or sb < 1e-9:
+        return None
+    a = (a - a.mean()) / sa
+    b = (b - b.mean()) / sb
+    gx, gy = gx / sb, gy / sb
+    J = np.stack([gx * xc, gx * yc, gy * xc, gy * yc, gx * s, gy * s], 1)
+    return float((a * b).mean()), n, J.T @ J, J.T @ (a - b)
+
+
+def solve_gauss(H: np.ndarray, g: np.ndarray) -> np.ndarray:
+    """Eliminacja Gaussa z częściowym wyborem elementu głównego (tak samo w js/align.js)."""
+    n = len(g)
+    M = np.hstack([H + np.diag(np.diag(H)) * 1e-9, g[:, None]])
+    for c in range(n):
+        piv = c + int(np.argmax(np.abs(M[c:, c])))
+        if abs(M[piv, c]) < 1e-300:
+            return np.zeros(n)
+        M[[c, piv]] = M[[piv, c]]
+        for r in range(c + 1, n):
+            M[r] -= M[r, c] / M[c, c] * M[c]
+    x = np.zeros(n)
+    for r in range(n - 1, -1, -1):
+        x[r] = (M[r, n] - M[r, r + 1:n] @ x[r + 1:]) / M[r, r]
+    return x
+
+
+def fit_affine(ref_lv: list, lv: list, shift: tuple, w: int, h: int):
+    """Dopasowuje klatkę do odniesienia, zaczynając od przesunięcia o całe piksele.
+    Zwraca (A, status): A = macierz 2x3 (współrzędne indeksów pikseli odniesienia -> klatki)
+    albo None; status: 'ok' (A do użycia), 'skip' (poprawka za mała), 'weak' (dopasowanie
+    niepewne) albo 'implausible' (obrót / skala / przesunięcie poza zakresem)."""
+    s_full = max(w, h) / 2
+    p = np.array([0, 0, 0, 0, shift[0] / s_full, shift[1] / s_full], np.float64)
+    p0 = p.copy()
+    for l in range(AFFINE_LEVELS - 1, -1, -1):
+        for _ in range(AFFINE_ITERS[AFFINE_LEVELS - 1 - l]):
+            t = affine_terms(ref_lv[l], lv[l], p, w, h)
+            if t is None:
+                return None, "weak"
+            step = np.clip(solve_gauss(t[2], t[3]), -AFFINE_MAX_STEP, AFFINE_MAX_STEP)
+            p = p + step
+            if np.abs(step).max() * max(w, h) / 2 / ref_lv[l]["lam"] < 0.005:
+                break
+    t0, t1 = affine_terms(ref_lv[0], lv[0], p0, w, h), affine_terms(ref_lv[0], lv[0], p, w, h)
+    if t0 is None or t1 is None or t1[0] < AFFINE_MIN_CC or t1[0] < t0[0]:
+        return None, "weak"
+    M = np.array([[1 + p[0], p[1]], [p[2], 1 + p[3]]])
+    T = p[4:6] * s_full
+    C = np.array([w / 2, h / 2])
+    A = np.hstack([M, (C + T - 0.5 - M @ (C - 0.5))[:, None]])
+    corners = np.array([[0, 0], [w - 1, 0], [0, h - 1], [w - 1, h - 1]], np.float64)
+    moved = corners @ A[:, :2].T + A[:, 2] - (corners + np.asarray(shift))
+    angle = np.degrees(np.arctan2(M[1, 0] - M[0, 1], M[0, 0] + M[1, 1]))
+    scale = np.sqrt(abs(np.linalg.det(M)))
+    if abs(angle) > AFFINE_MAX_ROT or abs(scale - 1) > AFFINE_MAX_SCALE or np.abs(moved).max() > AFFINE_MAX_MOVE * max(w, h):
+        return None, "implausible"
+    if np.abs(moved).max() < AFFINE_SKIP_PX:
+        return None, "skip"
+    return A, "ok"
+
+
+def common_crop(transforms: list, w: int, h: int):
+    """Największy prostokąt we współrzędnych odniesienia, który po przekształceniu każdej klatki
+    leży w jej kadrze (rogi liczone konserwatywnie: lewy brzeg = skrajniejszy z dwóch lewych rogów
+    itd.). Dla samych przesunięć o całe piksele daje dokładnie ten sam wycinek co dawniej.
+    transforms: lista (A 2x3, margines) — A mapuje współrzędne odniesienia na współrzędne klatki."""
+    x0, x1, y0, y1 = -np.inf, np.inf, -np.inf, np.inf
+    for A, m in transforms:
+        inv = cv2.invertAffineTransform(np.asarray(A, np.float64))
+        q = [inv @ np.array([x, y, 1.0]) for x, y in ((m, m), (w - 1 - m, m), (m, h - 1 - m), (w - 1 - m, h - 1 - m))]
+        x0, x1 = max(x0, q[0][0], q[2][0]), min(x1, q[1][0], q[3][0])
+        y0, y1 = max(y0, q[0][1], q[1][1]), min(y1, q[2][1], q[3][1])
+    x0, x1, y0, y1 = (round(float(v), 3) for v in (x0, x1, y0, y1))
+    x0, y0 = int(np.ceil(x0)), int(np.ceil(y0))
+    return x0, y0, int(np.floor(x1)) - x0 + 1, int(np.floor(y1)) - y0 + 1
+
+
+def warp_frame(img: np.ndarray, A: np.ndarray, x0: int, y0: int, cw: int, ch: int) -> np.ndarray:
+    X, Y = np.meshgrid(np.arange(x0, x0 + cw, dtype=np.float32), np.arange(y0, y0 + ch, dtype=np.float32))
+    mx = (A[0, 0] * X + A[0, 1] * Y + A[0, 2]).astype(np.float32)
+    my = (A[1, 0] * X + A[1, 1] * Y + A[1, 2]).astype(np.float32)
+    out = np.empty((ch, cw, 3), np.float32)
+    for c in range(3):
+        out[..., c] = cv2.remap(img[..., c], mx, my, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+    return np.clip(out, 0, None)
+
+
 def align_frames(frames: list, name: str) -> list:
-    """Wyrównuje klatki przesunięte między zdjęciami (bez obrotu) do klatki o środkowej
-    jasności i przycina do wspólnej części — najwyżej o MAX_CROP, inaczej zostawia bez zmian."""
+    """Wyrównuje klatki przesunięte lub przekrzywione między zdjęciami do klatki o środkowej
+    jasności i przycina do wspólnej części — najwyżej o MAX_CROP, inaczej zostawia bez zmian.
+    Najpierw przesunięcie o całe piksele (mapy progu medianowego, odporne na ekspozycję), potem
+    poprawka afiniczna (obrót, pochylenie, skala, ułamki piksela), jeśli jest wyraźna."""
     h, w = frames[0].shape[:2]
     levels = int(np.ceil(np.log2(MAX_CROP * max(w, h) + 1))) - 1
     while levels > 0 and min(w, h) >> levels < 32:
         levels -= 1
-    pyrs, means = [], []
+    pyrs, means, grays = [], [], []
     for img in frames:
         g = np.log(np.maximum(img.mean(-1), np.float32(1e-6)))
+        grays.append(g)
         means.append(float(g.mean(dtype=np.float64)))
         pyr = [g]
         for _ in range(levels):
@@ -423,16 +606,32 @@ def align_frames(frames: list, name: str) -> list:
         pyrs.append([threshold_codes(p, med) for p in pyr])
     ref = sorted(range(len(frames)), key=lambda k: means[k])[len(frames) // 2]
     shifts = [(0, 0) if k == ref else find_shift(pyrs[ref], pyrs[k]) for k in range(len(frames))]
-    if not any(sx or sy for sx, sy in shifts):
+
+    affines = [None] * len(frames)
+    ref_lv = affine_levels(grays[ref])
+    for k in range(len(frames)):
+        if k == ref:
+            continue
+        A, status = fit_affine(ref_lv, affine_levels(grays[k]), shifts[k], w, h)
+        if status == "ok":
+            affines[k] = A
+        elif status == "implausible":
+            print(f"  Uwaga: {name}…: klatka {k + 1} jest obrócona lub przeskalowana ponad normę, "
+                  f"zostaje samo przesunięcie.")
+    del grays
+    if not any(sx or sy for sx, sy in shifts) and not any(a is not None for a in affines):
         return frames
-    x0, x1 = max(0, *(-sx for sx, _ in shifts)), min(w, *(w - sx for sx, _ in shifts))
-    y0, y1 = max(0, *(-sy for _, sy in shifts)), min(h, *(h - sy for _, sy in shifts))
-    if x1 - x0 < (1 - MAX_CROP) * w or y1 - y0 < (1 - MAX_CROP) * h:
+
+    transforms = [(affines[k], AFFINE_MARGIN) if affines[k] is not None
+                  else (np.array([[1, 0, sx], [0, 1, sy]], np.float64), 0) for k, (sx, sy) in enumerate(shifts)]
+    x0, y0, cw, ch = common_crop(transforms, w, h)
+    if cw < (1 - MAX_CROP) * w or ch < (1 - MAX_CROP) * h:
         print(f"  Uwaga: {name}…: klatki są przesunięte za bardzo (przycięcie > {MAX_CROP:.0%}), "
               f"pomijam wyrównanie.")
         return frames
-    return [img[y0 + sy:y1 + sy, x0 + sx:x1 + sx] for img, (sx, sy) in zip(frames, shifts)]
-
+    return [warp_frame(img, affines[k], x0, y0, cw, ch) if affines[k] is not None
+            else img[y0 + sy:y0 + sy + ch, x0 + sx:x0 + sx + cw]
+            for k, (img, (sx, sy)) in enumerate(zip(frames, shifts))]
 
 def auto_exposure(linear: list, key: float) -> list:
     """Jedno wzmocnienie dla wszystkich klatek (zachowuje odstępy EV), liczone ze środkowej

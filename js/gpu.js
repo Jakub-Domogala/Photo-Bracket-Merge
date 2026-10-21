@@ -287,6 +287,24 @@ ${ID2}
   dst[i] = src[(u32(y) + p.y0) * p.sw + u32(x) + p.x0];
 }`,
   },
+  affine: {
+    fields: [["u32", "w"], ["u32", "h"], ["u32", "sw"], ["u32", "sh"], ["f32", "x0"], ["f32", "y0"],
+      ["f32", "a"], ["f32", "b"], ["f32", "c"], ["f32", "d"], ["f32", "e"], ["f32", "f"]],
+    body: (u) => `${u}
+${ro(1, "sb")} ${ro(2, "sg")} ${ro(3, "sr")} ${rw(4, "db")} ${rw(5, "dg")} ${rw(6, "dr")}
+${sampler("sb")} ${sampler("sg")} ${sampler("sr")}
+${ID2}
+  let X = p.x0 + f32(x);
+  let Y = p.y0 + f32(y);
+  let mx = p.a * X + p.b * Y + p.c;
+  let my = p.d * X + p.e * Y + p.f;
+  let w = i32(p.sw);
+  let h = i32(p.sh);
+  db[i] = max(sample_sb(mx, my, w, h), 0.0);
+  dg[i] = max(sample_sg(mx, my, w, h), 0.0);
+  dr[i] = max(sample_sr(mx, my, w, h), 0.0);
+}`,
+  },
   clip: {
     fields: [["u32", "n"]],
     body: (u) => `${u}
@@ -525,9 +543,15 @@ export async function gpuMerge(gpu, frames, lens, key, align, alloc, progress = 
       imgs = imgs.map((g, k) => {
         const [sx, sy] = plan.shifts[k];
         const out = {};
-        for (const c of ["b", "g", "r"]) {
-          out[c] = gpu.buf(plan.w * plan.h);
-          gpu.run("crop", { w: plan.w, h: plan.h, sw: w, x0: plan.x0 + sx, y0: plan.y0 + sy }, [g[c], out[c]], [plan.w, plan.h]);
+        for (const c of ["b", "g", "r"]) out[c] = gpu.buf(plan.w * plan.h);
+        const A = plan.affines[k];
+        if (A) {
+          gpu.run("affine", { w: plan.w, h: plan.h, sw: w, sh: h, x0: plan.x0, y0: plan.y0, a: A[0], b: A[1], c: A[2], d: A[3], e: A[4], f: A[5] },
+            [g.b, g.g, g.r, out.b, out.g, out.r], [plan.w, plan.h]);
+        } else {
+          for (const c of ["b", "g", "r"]) {
+            gpu.run("crop", { w: plan.w, h: plan.h, sw: w, x0: plan.x0 + sx, y0: plan.y0 + sy }, [g[c], out[c]], [plan.w, plan.h]);
+          }
         }
         gpu.release(g.b, g.g, g.r);
         return out;

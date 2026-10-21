@@ -4,7 +4,7 @@ Merges bracketed RAW exposures (e.g. −2 / 0 / +2 EV, tripod) into one natural-
 
 **Everything runs in the browser** — photos are never uploaded. Drop the RAW files, click **Połącz**, then **Pobierz**. One bracket gives a JPEG; several give a ZIP.
 
-Pipeline: RAW → linear RGB (camera WB) → optional lens correction (Sony: profile embedded in the ARW; other cameras: measured from the camera's JPEG preview inside the RAW) → alignment of frames shifted between shots (translation only, median threshold bitmaps; crops at most 3 %, otherwise skipped) → common auto-exposure for the bracket → Mertens fusion → optional auto WB → tone finish (white stretch with soft highlight shoulder, black point, gentle S-curve, all on luminance so hues are preserved).
+Pipeline: RAW → linear RGB (camera WB) → optional lens correction (Sony: profile embedded in the ARW; other cameras: measured from the camera's JPEG preview inside the RAW) → alignment of frames moved between shots (whole-pixel shift from median threshold bitmaps, then an affine refinement for tilt, rotation, scale and sub-pixel shifts; crops at most 3 %, otherwise skipped) → common auto-exposure for the bracket → Mertens fusion → optional auto WB → tone finish (white stretch with soft highlight shoulder, black point, gentle S-curve, all on luminance so hues are preserved).
 
 ## Supported formats
 
@@ -20,7 +20,7 @@ Anything LibRaw decodes: Sony `.ARW/.SRF/.SR2`, Canon `.CR2/.CR3/.CRW`, Nikon `.
   - `js/pipeline.js` — the processing steps, a 1:1 port of the Python reference (Mertens mirrors OpenCV's implementation, including pyramid border handling).
   - `js/exec.js`, `js/kernels.js`, `js/compute-worker.js` — parallel execution. Heavy loops are written as row kernels `(args, y0, y1)`; `PoolExec` splits the rows across a pool of workers (one per CPU core, images in `SharedArrayBuffer`), `InlineExec` runs the same kernels on one thread when shared memory isn't available. Both give the same output.
   - `js/gpu.js` — WebGPU version of lens correction, auto-exposure and Mertens fusion (used when available; on any GPU error the CPU path runs instead). Output differs from the CPU path only by float32 rounding (≤ 0.002/255 mean, ~0.0002 % of pixels off by more than 1 level). Add `?cpu` to the page URL to force the CPU path.
-  - `js/align.js` — alignment of frames shifted between shots (translation only, max 3 % crop, no UI option).
+  - `js/align.js` — alignment of frames moved between shots (no UI option, always on). Step 1 finds a whole-pixel shift (max 3 % crop). Step 2 refines it with an affine fit (Gauss-Newton on the gradient of log luminance, 3-level pyramid at ≤ 2000 px, clipped and near-black pixels masked, so frames of different exposure compare directly). The fit is only applied if it moves a corner by ≥ 0.5 px, so tripod brackets keep the exact pixel-shift crop; implausible fits (> 3° rotation, > 5 % scale, correlation below the unrefined one) are ignored, with a warning when the rotation/scale is out of range. Warped frames are resampled with bicubic interpolation (WebGPU kernel `affine` / CPU `affineWarp`).
   - `js/decode.js` — RAW decoding (each frame of a bracket in its own worker); `js/jpeg.js` — preview JPEG decoding.
   - `js/lens.js` — reads the Sony lens profile (ARW tags `0x7032/0x7035/0x7037`) and applies it.
   - `js/previewLens.js` — lens correction measured from the embedded JPEG preview (non-Sony cameras).
@@ -45,6 +45,13 @@ python3 -m http.server 8000    # http://127.0.0.1:8000
 python3.10 -m venv .venv && .venv/bin/pip install -r requirements.txt
 node --max-old-space-size=8192 tests/run_js.mjs <folder_with_raw> /tmp/out [--lens-correction] [--auto-wb] [--threads N] [--timing]
 .venv/bin/python tests/compare.py <folder_with_raw> /tmp/out [--lens-correction] [--auto-wb]
+```
+
+Alignment check against the reference on a bracket whose frames are distorted by a known transform (rotation up to 0.8°, shear, scale, 20 px shift; recovered to ≤ 0.6 px at 6000 px width):
+
+```sh
+.venv/bin/python tests/dump_align.py <folder_with_raw> /tmp/align [seed]
+node tests/check_align.mjs /tmp/align      # plan and warped pixels must match cv2 (≤ 1e-6 / 1e-4)
 ```
 
 On 14 test brackets the outputs match: mean difference ≤ 0.001/255 (0.03/255 with auto WB), ≤ 0.003 % of pixels off by more than 2 levels.
