@@ -16,7 +16,8 @@ Anything LibRaw decodes: Sony `.ARW/.SRF/.SR2`, Canon `.CR2/.CR3/.CRW`, Nikon `.
 
 ## Layout
 
-- `index.html`, `js/` — the web app (no build step, plain ES modules).
+- `index.html`, `src/` — the UI: Vite + React + Tailwind 4 + shadcn/ui (base-luma), with a Buy-me-a-coffee footer. `pnpm dev` / `pnpm build` (deployed to GitHub Pages by `.github/workflows/deploy.yml`).
+- `public/engine/` — the processing engine, served as-is (not bundled: LibRaw-Wasm spawns its own workers) and loaded by `src/lib/engine.ts`. Plain ES modules; the paths below are relative to it.
   - `js/pipeline.js` — the processing steps, a 1:1 port of the Python reference (Mertens mirrors OpenCV's implementation, including pyramid border handling).
   - `js/exec.js`, `js/kernels.js`, `js/compute-worker.js` — parallel execution. Heavy loops are written as row kernels `(args, y0, y1)`; `PoolExec` splits the rows across a pool of workers (one per CPU core, images in `SharedArrayBuffer`), `InlineExec` runs the same kernels on one thread when shared memory isn't available. Both give the same output.
   - `js/gpu.js` — WebGPU version of lens correction, auto-exposure and Mertens fusion (used when available; on any GPU error the CPU path runs instead). Output differs from the CPU path only by float32 rounding (≤ 0.002/255 mean, ~0.0002 % of pixels off by more than 1 level). Add `?cpu` to the page URL to force the CPU path.
@@ -24,19 +25,17 @@ Anything LibRaw decodes: Sony `.ARW/.SRF/.SR2`, Canon `.CR2/.CR3/.CRW`, Nikon `.
   - `js/decode.js` — RAW decoding (each frame of a bracket in its own worker); `js/jpeg.js` — preview JPEG decoding.
   - `js/lens.js` — reads the Sony lens profile (ARW tags `0x7032/0x7035/0x7037`) and applies it.
   - `js/previewLens.js` — lens correction measured from the embedded JPEG preview (non-Sony cameras).
-  - `js/worker.js` — runs everything off the UI thread and owns the worker pool; `js/app.js` — UI; `js/zip.js` — ZIP for several brackets; `js/tiff.js` — minimal 16-bit RGB TIFF writer (little-endian, uncompressed, one strip).
+  - `js/worker.js` — runs everything off the UI thread and owns the worker pool; `js/zip.js` — ZIP for several brackets; `js/tiff.js` — minimal 16-bit RGB TIFF writer (little-endian, uncompressed, one strip).
 - `js/formats.js` — accepted RAW extensions.
 - `vendor/libraw-wasm/` — [LibRaw-Wasm](https://github.com/ybouane/LibRaw-Wasm) 1.6.0 (LibRaw compiled to WebAssembly) for RAW decoding.
-- `coi-serviceworker.js` — [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) 0.1.7. LibRaw-Wasm needs `SharedArrayBuffer`, which requires COOP/COEP headers that GitHub Pages can't set; this service worker adds them.
+- `public/coi-serviceworker.js` — [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) 0.1.7. LibRaw-Wasm needs `SharedArrayBuffer`, which requires COOP/COEP headers that GitHub Pages can't set; this service worker adds them.
 - `reference/bracket_merge.py` — the original Python implementation (also a CLI), kept as the source of truth for tests.
 - `tests/` — JS-vs-Python comparison (`tests/vendor/` holds the jpeg-js decoder Node needs for previews).
 
 ## Run locally
 
-Any static server works (the service worker handles isolation on `localhost` too):
-
 ```sh
-python3 -m http.server 8000    # http://127.0.0.1:8000
+pnpm install && pnpm dev    # http://localhost:5173
 ```
 
 ## Verify the JS port against Python

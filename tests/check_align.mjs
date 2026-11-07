@@ -2,8 +2,8 @@
 // plan (macierze afiniczne, wycinek) z alignPlan i piksele z affineWarpRows.
 // Użycie: node tests/check_align.mjs <prefiks_wyjścia_dump_align>
 import fs from "fs";
-import { InlineExec } from "../js/exec.js";
-import { alignPlan, affineWarpRows } from "../js/align.js";
+import { InlineExec } from "../public/engine/js/exec.js";
+import { alignPlan, affineWarpRows } from "../public/engine/js/align.js";
 
 const base = process.argv[2];
 const meta = JSON.parse(fs.readFileSync(base + ".json"));

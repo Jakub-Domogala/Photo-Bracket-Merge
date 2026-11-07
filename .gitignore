@@ -4,3 +4,7 @@ __pycache__/
 *.arw
 *.tif
 .DS_Store
+node_modules
+dist
+*.local
+*/*lock.yaml

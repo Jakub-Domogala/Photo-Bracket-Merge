@@ -7,10 +7,10 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { Worker } from "worker_threads";
-import { mergeBracket } from "../js/merge.js";
-import { PoolExec, InlineExec, COMPUTE_WORKER_URL } from "../js/exec.js";
-import { isRaw } from "../js/formats.js";
-import { makeTiff } from "../js/tiff.js";
+import { mergeBracket } from "../public/engine/js/merge.js";
+import { PoolExec, InlineExec, COMPUTE_WORKER_URL } from "../public/engine/js/exec.js";
+import { isRaw } from "../public/engine/js/formats.js";
+import { makeTiff } from "../public/engine/js/tiff.js";
 
 const [dir, out, ...flags] = process.argv.slice(2);
 const flagValue = (name, def) => (flags.includes(name) ? Number(flags[flags.indexOf(name) + 1]) : def);
